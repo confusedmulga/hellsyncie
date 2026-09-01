@@ -12,8 +12,8 @@ Read this before writing code against it. Sections are numbered. Notes marked
 1.1 hellsyncie is a library. App developers add it to keep one user's data the
     same across that user's phone, tablet, and laptop.
 
-1.2 It uses no server. It uses storage the user already owns — a Google Drive
-    folder, a plain folder, an S3 bucket — as a shared drop box. Devices leave
+1.2 It uses no server. It uses storage the user already owns - a Google Drive
+    folder, a plain folder, an S3 bucket - as a shared drop box. Devices leave
     files there and pick up each other's files.
 
 1.3 It never shows a merge conflict. Two devices may edit the same data while
@@ -80,15 +80,15 @@ Read this before writing code against it. Sections are numbered. Notes marked
 4.1 Build order is deliberate. The test harness is built BEFORE the sync engine.
     The harness is a torture chamber; the engine is built inside it.
 
-4.2 Stage 1 — SHIPPED IN THIS BUILD:
+4.2 Stage 1 - SHIPPED IN THIS BUILD:
     - The storage contract (`Backend`: list, download, upload, delete).
     - The versioned, checksummed change-file format.
     - A simulated backend that injects five real storage faults on demand.
     - A simulated device (durable log, upload-retry, crash/restart).
     - A deterministic fuzzer: N devices, random changes, random sync order,
-      random faults — one seed reproduces an entire run exactly.
+      random faults - one seed reproduces an entire run exactly.
 
-4.3 Stage 2 — LATER BUILDS: the CRDT engine (the merge logic) and the concrete
+4.3 Stage 2 - LATER BUILDS: the CRDT engine (the merge logic) and the concrete
     storage backends (plain folder, Google Drive). The engine slots in behind
     one interface, `SyncEngine`, which the harness already calls.
 
@@ -149,7 +149,7 @@ dart pub global activate melos
 
 6.1 For the app maker / business:
     - No sync server to build, pay for, scale, or wake up for at 3 a.m.
-    - Sync — normally a deep, error-prone build — arrives as a library proven
+    - Sync - normally a deep, error-prone build - arrives as a library proven
       by a fuzz suite.
     - One dependency reused across an entire app portfolio.
 
@@ -162,7 +162,7 @@ dart pub global activate melos
 
 6.3 For technical robustness:
     - Assumes storage lies, and is tested against exactly those lies.
-    - Append-only log is a complete history — free version history.
+    - Append-only log is a complete history - free version history.
     - Every failure is reproducible from a single seed.
     - Storage layer is four methods, so the same engine runs over a folder, S3,
       Drive, or anything else with no rewrite.
@@ -179,7 +179,7 @@ dart pub global activate melos
     experience an app whose data is the same everywhere and never loses edits.
 
 7.2 Sweet spot: single-user, personal, offline-capable apps across a handful of
-    the user's own devices — notes, journals, task and habit trackers, reading
+    the user's own devices - notes, journals, task and habit trackers, reading
     lists, budgets, personal wikis.
 
 7.3 Integration shape (any app):
@@ -193,8 +193,8 @@ dart pub global activate melos
 ## 8. FLUTTER (ANDROID) INTEGRATION
 
 **NOTE** The runtime engine and Flutter binding ship in a later build (Stage 2,
-per §4.3). The steps below are the TARGET integration — the intended, stable
-shape of the API — so an app team can plan against it now. Names may tighten
+per §4.3). The steps below are the TARGET integration - the intended, stable
+shape of the API - so an app team can plan against it now. Names may tighten
 before 1.0.
 
 8.1 Add dependencies. In the app's `pubspec.yaml`:
@@ -217,7 +217,7 @@ dependencies:
     **NOTE** Drive uses the hidden per-app `appDataFolder`. It is private to the
     app, invisible in the user's Drive UI, and needs no broad storage
     permission. Sign-in is the user's own Google account via the standard
-    consent screen — you do not build or host anything.
+    consent screen - you do not build or host anything.
 
 8.3 Open a store on app start. Target API:
 
@@ -247,10 +247,10 @@ items.insert(0, 'Milk');
 ```
 
     **WARNING** Do not store the body of a document as one field if two devices
-    may edit it at once — one side's edit is dropped by design at this stage.
+    may edit it at once - one side's edit is dropped by design at this stage.
     Rich-text merge is deferred to 1.0.
 
-8.5 Sync. Target API — call after local edits, on reconnect, and on resume:
+8.5 Sync. Target API - call after local edits, on reconnect, and on resume:
 
 ```dart
 await store.sync();        // one round: push local, pull remote, converge
