@@ -1,0 +1,14 @@
+# Workspace root for the hellsyncie monorepo.
+# `dart pub get` here resolves every member package at once (pub workspaces).
+# Melos is optional tooling for orchestration; see melos.yaml.
+name: hellsyncie_workspace
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+
+workspace:
+  - packages/sync_engine
+  - packages/sync_engine_flutter
+  - packages/sync_backend_fs
+  - packages/sync_backend_drive

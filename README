@@ -1,0 +1,90 @@
+Read this fully before writing anything.
+
+# Project: offline-first CRDT sync library for Dart (monorepo)
+
+You are building a standalone, publishable Dart library that syncs app data
+across devices using only dumb file storage (Google Drive appDataFolder,
+plain folders, S3) — no server. Convergence is guaranteed by CRDTs over an
+append-only op log. Apps (built later, separately) will consume this library.
+
+## This session's scope — SCAFFOLD + SIMULATION HARNESS ONLY
+
+Do not write any CRDT or engine logic in this session. The harness comes
+first; the engine will be built against it in later sessions.
+
+### Task 1: Scaffold
+
+Create a melos monorepo:
+
+packages/
+  sync_engine/          # pure Dart. ZERO deps on Flutter, Drive, or IO-heavy libs
+  sync_engine_flutter/  # empty stub for now
+  sync_backend_fs/      # empty stub for now
+  sync_backend_drive/   # empty stub for now
+docs/DESIGN.md
+empty file
+CLAUDE.md               # write it per the rules below
+
+CLAUDE.md must contain these project rules verbatim in substance:
+- packages/sync_engine stays pure Dart, no Flutter/Drive imports, ever
+- Backend contract is exactly four methods: list, download, upload, delete
+- Op log is append-only; each device writes ONLY its own files, never
+  another device's
+- On-disk format is versioned from day one
+- CRDT choices are fixed: LWW-register maps, OR-sets, RGA lists. Rich text
+  is out of scope until 1.0
+- Simulation harness is built before engine features; every engine change
+  must pass the fuzz suite
+- NEVER weaken, delete, or skip a failing convergence assertion. A failing
+  seed means an engine bug. Fix the engine. If you believe the assertion
+  itself is wrong, stop and ask me — do not edit it
+- Failing seeds get committed to test/regression_seeds.dart as permanent
+  regression tests
+- No new dependencies without asking me first
+- Plan mode required for anything touching merge or compaction logic
+
+### Task 2: Simulation harness (in packages/sync_engine/test/harness/)
+
+Build, in this order:
+
+1. `Backend` interface — the four-method contract. This is the real
+   production interface, define it in lib/, not test/.
+   list() returns file names + metadata; download/upload move opaque bytes;
+   delete removes. Document that implementations may exhibit stale listings.
+
+2. `SimulatedBackend` implements Backend in-memory with injectable faults,
+   each independently controllable by probability:
+   - truncated upload (partial bytes persisted, then failure surfaced)
+   - stale list() (returns a snapshot from N operations ago)
+   - delayed visibility (uploaded file absent from list() for K steps)
+   - dropped upload (reports success, persists nothing)
+   - duplicate delivery (same file appears twice under listing)
+
+3. `SimulatedDevice` — holds a device ID, a local op log, a pending-op
+   buffer, and a sync() method stubbed to throw UnimplementedError (engine
+   comes later). Structure it so the future engine slots in behind one
+   interface.
+
+4. Fuzz driver:
+   - deterministic seeded RNG (single seed reproduces the entire run:
+     device count, op sequence, sync ordering, fault schedule)
+   - N devices (2–8), M steps; each step randomly: local op, sync attempt,
+     crash-and-restart of a device, or clock skew adjustment
+   - at end: force full sync rounds until quiescent, then assert all
+     devices hold byte-identical state
+   - on failure: print the seed prominently and dump per-device op logs
+     to a debug directory
+
+5. A CLI entry: `dart test/harness/fuzz.dart --seed=X --iterations=N`
+   plus a normal dart test that runs 1000 iterations with random seeds.
+
+### Constraints for this session
+- Local ops are placeholder (opaque payload bytes) since no CRDT exists yet;
+  convergence assertion for now checks op-log set equality across devices,
+  not merged state. Note this clearly as TODO for session 2.
+- Null safety, dart format clean, no analyzer warnings.
+- Ask before adding any dependency. package:test and melos are pre-approved.
+
+When done: show me the file tree, the Backend interface, the fault
+injection API, and one example fuzz failure output (force a fault with
+100% probability to demonstrate the seed-replay workflow).

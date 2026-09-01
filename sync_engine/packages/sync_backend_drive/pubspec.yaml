@@ -1,0 +1,11 @@
+name: sync_backend_drive
+description: >-
+  Google Drive appDataFolder Backend for the hellsyncie sync engine — hidden
+  per-app storage in the user's own Drive, no server. STUB — implemented later.
+version: 0.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+
+resolution: workspace

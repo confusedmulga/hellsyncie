@@ -1,0 +1,15 @@
+name: sync_engine
+description: >-
+  Offline-first CRDT sync engine (pure Dart). Defines the storage Backend
+  contract, the versioned on-disk op format, and the deterministic simulation
+  harness the engine is built against. ZERO Flutter / Drive / IO-heavy deps.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+
+resolution: workspace
+
+dev_dependencies:
+  test: ^1.25.0

@@ -1,0 +1,12 @@
+name: sync_backend_fs
+description: >-
+  Filesystem Backend for the hellsyncie sync engine — a plain folder (local
+  disk or a synced folder such as Dropbox/Drive desktop) via dart:io.
+  STUB — implemented later.
+version: 0.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+
+resolution: workspace

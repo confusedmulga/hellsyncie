@@ -1,0 +1,7 @@
+# Dart / Pub
+.dart_tool/
+build/
+pubspec.lock
+
+# Fuzzer failure dumps (regenerated on demand; pin seeds in regression_seeds.dart)
+.fuzz_failures/

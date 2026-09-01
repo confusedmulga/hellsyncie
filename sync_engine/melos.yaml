@@ -1,0 +1,38 @@
+# Melos configuration for the hellsyncie monorepo.
+#
+# Melos is OPTIONAL. Pub workspaces (see pubspec.yaml) already bootstrap every
+# package with a single `dart pub get` at this directory. Melos adds convenience
+# scripts across all packages. Install it once (pre-approved dependency):
+#
+#     dart pub global activate melos
+#
+# then run, from this directory:
+#
+#     melos bootstrap      # pub get across all packages
+#     melos run test       # run the test suite in every package
+#     melos run analyze    # static analysis across the monorepo
+name: hellsyncie
+
+packages:
+  - packages/*
+
+scripts:
+  test:
+    description: Run the test suite in every package.
+    run: dart test
+    exec:
+      concurrency: 1
+
+  analyze:
+    description: Static analysis across the monorepo. Must be warning-clean.
+    run: dart analyze --fatal-infos .
+
+  format-check:
+    description: Verify formatting without writing changes.
+    run: dart format --output=none --set-exit-if-changed .
+
+  fuzz:
+    description: Run the convergence fuzzer once with a random seed.
+    run: dart run test/harness/fuzz.dart --iterations=1
+    packageFilters:
+      scope: sync_engine

@@ -1,0 +1,19 @@
+# Strict analysis for the whole workspace. Engine code must be warning-clean.
+analyzer:
+  language:
+    strict-casts: true
+    strict-raw-types: true
+  errors:
+    # Treat these as errors, not hints — correctness discipline for a sync lib.
+    unawaited_futures: error
+    unused_import: error
+    unused_local_variable: error
+
+linter:
+  rules:
+    - avoid_empty_else
+    - avoid_relative_lib_imports
+    - cancel_subscriptions
+    - close_sinks
+    - prefer_final_locals
+    - unnecessary_await_in_return

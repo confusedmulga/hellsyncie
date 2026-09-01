@@ -1,0 +1,12 @@
+name: sync_engine_flutter
+description: >-
+  Flutter bindings for the hellsyncie sync engine (lifecycle-aware sync,
+  path_provider wiring, ChangeNotifier surfaces). STUB — implemented later.
+  Kept Flutter-free for now so the workspace resolves with `dart pub get`.
+version: 0.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+
+resolution: workspace
