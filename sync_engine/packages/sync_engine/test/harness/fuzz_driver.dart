@@ -78,13 +78,17 @@ Future<FuzzResult> runFuzz(int seed, {FuzzConfig? config}) async {
     final dev = devices[rng.nextInt(devices.length)];
     final roll = rng.nextInt(100);
     if (roll < 55) {
-      // Local op: an LWW field write over a small doc/field space, so devices
-      // contend on the same fields and merge order actually matters.
-      dev.applyPut(
-        'doc${rng.nextInt(3)}',
-        'f${rng.nextInt(5)}',
-        _randomPayload(rng),
-      );
+      // Local op over a small doc/field/element space, so devices contend and
+      // merge order matters: LWW put, OR-set add, or OR-set remove.
+      final docId = 'doc${rng.nextInt(3)}';
+      switch (rng.nextInt(3)) {
+        case 0:
+          dev.applyPut(docId, 'f${rng.nextInt(5)}', _randomPayload(rng));
+        case 1:
+          dev.applyAdd(docId, 'tags', _element(rng));
+        default:
+          dev.applyRemove(docId, 'tags', _element(rng));
+      }
     } else if (roll < 85) {
       await dev.sync(backend); // real merge round
     } else if (roll < 95) {
@@ -166,6 +170,10 @@ Uint8List _randomPayload(Random rng) {
   return Uint8List.fromList(
       <int>[for (var i = 0; i < len; i++) rng.nextInt(256)]);
 }
+
+/// One of a small set of OR-set elements, so adds and removes collide.
+Uint8List _element(Random rng) =>
+    Uint8List.fromList('t${rng.nextInt(5)}'.codeUnits);
 
 int _totalLog(List<SimulatedDevice> devices) {
   var n = 0;

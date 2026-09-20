@@ -56,6 +56,31 @@ class SimulatedDevice {
     _mint(OperationCodec.encode(op));
   }
 
+  /// Author an OR-set add. Stamps the element with a fresh unique HLC tag.
+  void applyAdd(String docId, String setField, Uint8List element) {
+    _clock = _clock.send(physicalMillis());
+    final op = SetAdd(
+      docId: docId,
+      setField: setField,
+      element: element,
+      tag: _clock,
+    );
+    _mint(OperationCodec.encode(op));
+  }
+
+  /// Author an OR-set remove. Observes (cancels) exactly the add-tags this
+  /// device currently holds for the element; concurrent adds survive.
+  void applyRemove(String docId, String setField, Uint8List element) {
+    final observed = CrdtEngine.addTagsFor(_log, docId, setField, element);
+    final op = SetRemove(
+      docId: docId,
+      setField: setField,
+      element: element,
+      observedTags: observed,
+    );
+    _mint(OperationCodec.encode(op));
+  }
+
   void _mint(Uint8List payload) {
     final op = Op(id, _seq++, payload);
     _add(op);
