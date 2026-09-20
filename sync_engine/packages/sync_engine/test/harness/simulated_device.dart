@@ -1,22 +1,30 @@
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:sync_engine/sync_engine.dart';
 
 /// A device in the simulation: a stable id, a durable append-only op log, a
-/// buffer of authored op files not yet confirmed on the backend, and the
-/// engine seam [sync] (which throws until the CRDT engine lands).
+/// hybrid logical clock, a buffer of authored op files not yet confirmed on the
+/// backend, and a real [sync] round backed by the CRDT engine.
 ///
 /// The device NEVER trusts an upload's success return — a file counts as
 /// persisted only once a real `list()` shows it. That is what defeats dropped
 /// and truncated uploads: unconfirmed files are re-pushed (idempotently, since
 /// op files are immutable and named by identity).
 class SimulatedDevice {
-  SimulatedDevice(this.id, {SyncEngine? engine}) : _engine = engine;
+  SimulatedDevice(this.id, {SyncEngine? engine})
+      : _engine = engine ?? const CrdtEngine(),
+        _clock = Hlc.zero(id);
 
   final String id;
-  // ignore: unused_field — wired now, exercised when the engine lands.
-  final SyncEngine? _engine;
+  final SyncEngine _engine;
+
+  /// Physical clock source (millis since epoch). Injected so the fuzzer stays
+  /// deterministic; production passes wall-clock time.
+  int Function() physicalMillis = () => DateTime.now().millisecondsSinceEpoch;
+
+  /// This device's hybrid logical clock, advanced on each local op. Durable —
+  /// survives [crashRestart] alongside the log.
+  Hlc _clock;
 
   final List<Op> _log = <Op>[];
   final Set<String> _keys = <String>{}; // op keys already in _log
@@ -33,15 +41,22 @@ class SimulatedDevice {
   /// delivery. Transient — rebuilt from the durable log on restart.
   final Set<String> _seenFiles = <String>{};
 
-  /// Placeholder for the HLC offset the clock-skew fuzz action nudges. The
-  /// engine consumes it later; today it only records that skew happened.
+  /// Physical-clock offset the clock-skew fuzz action nudges. The injected
+  /// [physicalMillis] adds it in, so skew flows into real HLC behavior.
   int clockSkewMs = 0;
 
   int get logLength => _log.length;
   List<Op> get log => List<Op>.unmodifiable(_log);
 
-  /// Append a local op with opaque [payload]. Queues its file for upload.
-  void applyLocalOp(Uint8List payload) {
+  /// Author a local field write (LWW-register map put). Advances the HLC,
+  /// encodes the operation, and mints an op file for it.
+  void applyPut(String docId, String field, Uint8List value) {
+    _clock = _clock.send(physicalMillis());
+    final op = MapPut(docId: docId, field: field, value: value, hlc: _clock);
+    _mint(OperationCodec.encode(op));
+  }
+
+  void _mint(Uint8List payload) {
     final op = Op(id, _seq++, payload);
     _add(op);
     final name = OpFileFormat.fileName(id, op.seq);
@@ -58,13 +73,11 @@ class SimulatedDevice {
     return false;
   }
 
-  /// ENGINE SEAM — the real CRDT merge lands here in a later build. Until then
-  /// the harness routes around it via [push] + [pull] (transport only).
+  /// One sync round: push local ops, then pull remote ops. The merge itself is
+  /// the pure fold in [materializedState] over the resulting op set.
   Future<void> sync(Backend backend) async {
-    throw UnimplementedError(
-      'CRDT engine arrives in a later build. The harness uses push()/pull() '
-      'for transport-only convergence (op-log set equality) until then.',
-    );
+    await push(backend);
+    await pull(backend);
   }
 
   /// Upload every unconfirmed authored file. Idempotent; safe to repeat.
@@ -132,28 +145,7 @@ class SimulatedDevice {
     }
   }
 
-  /// Placeholder materialized state: canonical bytes of the op-log SET, ordered
-  /// by `(deviceId, seq)`.
-  ///
-  /// TODO(engine): replace with `_engine!.materialize(_log)` once the CRDT
-  /// engine exists, and switch the convergence assertion from op-log set
-  /// equality to merged-state equality.
-  Uint8List materializedState() {
-    final ops = List<Op>.of(_log)
-      ..sort((a, b) {
-        final c = a.deviceId.compareTo(b.deviceId);
-        return c != 0 ? c : a.seq.compareTo(b.seq);
-      });
-    final bb = BytesBuilder();
-    for (final op in ops) {
-      bb
-        ..add(utf8.encode(op.deviceId))
-        ..addByte(0)
-        ..add(utf8.encode('${op.seq}'))
-        ..addByte(0)
-        ..add(op.payload)
-        ..addByte(0);
-    }
-    return bb.toBytes();
-  }
+  /// The converged materialized state: the CRDT engine's pure fold over every
+  /// op this device holds. Byte-identical across devices with the same op set.
+  Uint8List materializedState() => _engine.materialize(_log);
 }

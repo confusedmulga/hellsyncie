@@ -6,7 +6,12 @@
 library;
 
 export 'src/backend.dart';
+export 'src/crdt/lww_register.dart';
+export 'src/crdt_engine.dart';
 export 'src/engine.dart';
 export 'src/format.dart';
+export 'src/hlc.dart';
 export 'src/op.dart';
 export 'src/op_codec.dart';
+export 'src/operation.dart';
+export 'src/operation_codec.dart';

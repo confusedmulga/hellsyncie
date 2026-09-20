@@ -65,25 +65,32 @@ Future<FuzzResult> runFuzz(int seed, {FuzzConfig? config}) async {
     for (var i = 0; i < deviceCount; i++) SimulatedDevice('d$i'),
   ];
 
+  // Deterministic physical clock: a monotonic base tick plus each device's own
+  // skew. Never wall-clock, so a seed reproduces every HLC exactly.
+  var physicalTick = 0;
+  for (final dev in devices) {
+    dev.physicalMillis = () => physicalTick + dev.clockSkewMs;
+  }
+
   // --- chaos phase ---
   for (var step = 0; step < cfg.steps; step++) {
+    physicalTick += 1;
     final dev = devices[rng.nextInt(devices.length)];
     final roll = rng.nextInt(100);
     if (roll < 55) {
-      dev.applyLocalOp(_randomPayload(rng));
+      // Local op: an LWW field write over a small doc/field space, so devices
+      // contend on the same fields and merge order actually matters.
+      dev.applyPut(
+        'doc${rng.nextInt(3)}',
+        'f${rng.nextInt(5)}',
+        _randomPayload(rng),
+      );
     } else if (roll < 85) {
-      // Sync attempt. Prove the engine seam exists and then fall back to the
-      // transport-only exchange until the engine is implemented.
-      try {
-        await dev.sync(backend);
-      } on UnimplementedError {
-        await dev.push(backend);
-        await dev.pull(backend);
-      }
+      await dev.sync(backend); // real merge round
     } else if (roll < 95) {
       dev.crashRestart();
     } else {
-      dev.clockSkewMs += rng.nextInt(2001) - 1000; // +/- 1s, placeholder
+      dev.clockSkewMs += rng.nextInt(2001) - 1000; // +/- 1s skew
     }
   }
 
@@ -126,8 +133,22 @@ Future<FuzzResult> runFuzz(int seed, {FuzzConfig? config}) async {
   for (var i = 1; i < states.length && converged; i++) {
     if (!_bytesEqual(reference, states[i])) {
       converged = false;
-      reason = 'device ${devices[i].id} diverged from ${devices.first.id}: '
-          '${states[i].length} state bytes vs ${reference.length}';
+      reason = 'device ${devices[i].id} merged state diverged from '
+          '${devices.first.id}: ${states[i].length} bytes vs '
+          '${reference.length}';
+    }
+  }
+
+  // Secondary invariant: identical op-log SETS (transport completeness).
+  if (converged) {
+    final refKeys = _opKeys(devices.first);
+    for (var i = 1; i < devices.length; i++) {
+      if (!_listEqualString(refKeys, _opKeys(devices[i]))) {
+        converged = false;
+        reason = 'device ${devices[i].id} op-log set differs from '
+            '${devices.first.id}';
+        break;
+      }
     }
   }
 
@@ -155,6 +176,17 @@ int _totalLog(List<SimulatedDevice> devices) {
 }
 
 bool _bytesEqual(Uint8List a, Uint8List b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+List<String> _opKeys(SimulatedDevice d) =>
+    d.log.map((op) => op.key).toList()..sort();
+
+bool _listEqualString(List<String> a, List<String> b) {
   if (a.length != b.length) return false;
   for (var i = 0; i < a.length; i++) {
     if (a[i] != b[i]) return false;
