@@ -25,7 +25,7 @@ seeded fuzzer + CLI + 1,000-iteration test.
 STATE: ops are placeholder bytes; convergence = op-log SET equality.
 GATE: 1,000-seed fuzz green.  MET.
 
-## 2. STAGE 2 — CRDT ENGINE CORE.  [IN PROGRESS — fuzz-gated slices]
+## 2. STAGE 2 — CRDT ENGINE CORE.  [DONE 2026-09-21 — fuzz-gated slices]
 
 COVERS: hybrid logical clock (HLC); LWW-register map (fields); OR-set
 (collections/tags, add-wins); RGA list (ordered lists); `CrdtEngine implements
@@ -38,7 +38,7 @@ associative) pass.
 
 - 2a — HLC + LWW-register map.  [DONE 2026-09-20]
 - 2b — OR-set (add-wins).       [DONE 2026-09-21]
-- 2c — RGA (ordered lists).     [NEXT]
+- 2c — RGA (ordered lists).     [DONE 2026-09-21]
 
 ## 3. STAGE 3 — REAL BACKENDS.  [parallelizable with Stage 2]
 
@@ -76,5 +76,6 @@ limitation, not a bug).
 
 ---
 
-CURRENT POSITION: Stage 2 in progress — slices 2a and 2b done and fuzz-green;
-2c (RGA) is next.
+CURRENT POSITION: Stage 2 complete — HLC + LWW map + OR-set + RGA all merge to
+byte-identical state and are fuzz-green. Next: Stage 3 (real backends) and/or
+Stage 4 (compaction, plan-mode).

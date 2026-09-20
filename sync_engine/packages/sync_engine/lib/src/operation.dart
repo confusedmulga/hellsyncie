@@ -67,3 +67,42 @@ class SetRemove extends Operation {
   String toString() => 'SetRemove($docId.$setField -= ${element.length} B, '
       '${observedTags.length} tags)';
 }
+
+/// Insert [value] into an RGA ordered list with a unique [id] (an HLC),
+/// positioned immediately after element [after] (null = list head). (Slice 2c.)
+class ListInsert extends Operation {
+  const ListInsert({
+    required this.docId,
+    required this.listField,
+    required this.id,
+    required this.after,
+    required this.value,
+  });
+
+  final String docId;
+  final String listField;
+  final Hlc id;
+  final Hlc? after;
+  final Uint8List value;
+
+  @override
+  String toString() =>
+      'ListInsert($docId.$listField id=$id after=$after, ${value.length} B)';
+}
+
+/// Tombstone the RGA element with id [elementId]. Elements inserted after it
+/// keep their position. (Slice 2c.)
+class ListDelete extends Operation {
+  const ListDelete({
+    required this.docId,
+    required this.listField,
+    required this.elementId,
+  });
+
+  final String docId;
+  final String listField;
+  final Hlc elementId;
+
+  @override
+  String toString() => 'ListDelete($docId.$listField id=$elementId)';
+}

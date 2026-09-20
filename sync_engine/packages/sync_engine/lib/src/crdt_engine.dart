@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'crdt/lww_register.dart';
 import 'crdt/or_set.dart';
+import 'crdt/rga.dart';
 import 'engine.dart';
 import 'hlc.dart';
 import 'op.dart';
@@ -22,6 +23,7 @@ class CrdtEngine implements SyncEngine {
   Uint8List materialize(Iterable<Op> ops) {
     final lww = <String, Map<String, LwwRegister>>{}; // doc -> field -> reg
     final sets = <String, Map<String, OrSet>>{}; // doc -> setField -> OrSet
+    final lists = <String, Map<String, Rga>>{}; // doc -> listField -> Rga
 
     for (final op in ops) {
       final Operation decoded;
@@ -41,9 +43,13 @@ class CrdtEngine implements SyncEngine {
           _setFor(sets, o.docId, o.setField).add(o.element, o.tag);
         case final SetRemove o:
           _setFor(sets, o.docId, o.setField).remove(o.element, o.observedTags);
+        case final ListInsert o:
+          _listFor(lists, o.docId, o.listField).insert(o.id, o.after, o.value);
+        case final ListDelete o:
+          _listFor(lists, o.docId, o.listField).delete(o.elementId);
       }
     }
-    return _serialize(lww, sets);
+    return _serialize(lww, sets, lists);
   }
 
   static OrSet _setFor(
@@ -55,6 +61,40 @@ class CrdtEngine implements SyncEngine {
             setField,
             OrSet.new,
           );
+
+  static Rga _listFor(
+    Map<String, Map<String, Rga>> lists,
+    String docId,
+    String listField,
+  ) =>
+      lists.putIfAbsent(docId, () => <String, Rga>{}).putIfAbsent(
+            listField,
+            Rga.new,
+          );
+
+  /// Every RGA element id for one list across [ops], in log order — what a
+  /// device folds to choose an insert anchor or a delete target. Pure/static.
+  static List<Hlc> elementIds(
+    Iterable<Op> ops,
+    String docId,
+    String listField,
+  ) {
+    final ids = <Hlc>[];
+    for (final op in ops) {
+      final Operation decoded;
+      try {
+        decoded = OperationCodec.decode(op.payload);
+      } on FormatException {
+        continue;
+      }
+      if (decoded is ListInsert &&
+          decoded.docId == docId &&
+          decoded.listField == listField) {
+        ids.add(decoded.id);
+      }
+    }
+    return ids;
+  }
 
   /// All add-tags for one element across [ops] — what a device folds to author
   /// a [SetRemove] that "observes" the element's current tags. Pure/static.
@@ -88,9 +128,11 @@ class CrdtEngine implements SyncEngine {
   Uint8List _serialize(
     Map<String, Map<String, LwwRegister>> lww,
     Map<String, Map<String, OrSet>> sets,
+    Map<String, Map<String, Rga>> lists,
   ) {
     final bb = BytesBuilder();
-    final docIds = <String>{...lww.keys, ...sets.keys}.toList()..sort();
+    final docIds = <String>{...lww.keys, ...sets.keys, ...lists.keys}.toList()
+      ..sort();
     _u32(bb, docIds.length);
     for (final docId in docIds) {
       _str(bb, docId);
@@ -114,6 +156,19 @@ class CrdtEngine implements SyncEngine {
         _u32(bb, elems.length);
         for (final e in elems) {
           _bytes(bb, e);
+        }
+      }
+
+      // RGA lists (sorted by name; values kept in LIST ORDER, not sorted).
+      final docLists = lists[docId] ?? const <String, Rga>{};
+      final listNames = docLists.keys.toList()..sort();
+      _u32(bb, listNames.length);
+      for (final name in listNames) {
+        _str(bb, name);
+        final values = docLists[name]!.toList();
+        _u32(bb, values.length);
+        for (final v in values) {
+          _bytes(bb, v);
         }
       }
     }

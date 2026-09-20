@@ -100,4 +100,42 @@ void main() {
     final s = engine.materialize(<Op>[add, rem]);
     expect(String.fromCharCodes(s), isNot(contains('y')));
   });
+
+  Op listInsert(
+    String dev,
+    int seq,
+    String doc,
+    String list,
+    String value,
+    Hlc id,
+    Hlc? after,
+  ) =>
+      Op(
+        dev,
+        seq,
+        OperationCodec.encode(ListInsert(
+          docId: doc,
+          listField: list,
+          id: id,
+          after: after,
+          value: Uint8List.fromList(value.codeUnits),
+        )),
+      );
+
+  test('RGA order is a deterministic function of the op set', () {
+    final a = const Hlc(1, 0, 'a');
+    final ops = <Op>[
+      listInsert('a', 0, 'd', 'items', 'A', a, null),
+      listInsert('a', 1, 'd', 'items', 'B', const Hlc(2, 0, 'a'), a),
+      listInsert('b', 0, 'd', 'items', 'C', const Hlc(2, 0, 'b'), a),
+    ];
+    final forward = engine.materialize(ops);
+    expect(engine.materialize(ops.reversed), forward); // order-independent
+    expect(engine.materialize(<Op>[...ops, ...ops]), forward); // idempotent
+    // Both B and C are inserted after A; the greater id (deviceId 'b') wins the
+    // slot right after A. Result: A, C, B.
+    final s = String.fromCharCodes(forward);
+    expect(s.indexOf('A') < s.indexOf('C'), isTrue);
+    expect(s.indexOf('C') < s.indexOf('B'), isTrue);
+  });
 }

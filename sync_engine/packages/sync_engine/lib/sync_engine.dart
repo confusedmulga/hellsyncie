@@ -8,6 +8,7 @@ library;
 export 'src/backend.dart';
 export 'src/crdt/lww_register.dart';
 export 'src/crdt/or_set.dart';
+export 'src/crdt/rga.dart';
 export 'src/crdt_engine.dart';
 export 'src/engine.dart';
 export 'src/format.dart';

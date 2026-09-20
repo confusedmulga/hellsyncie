@@ -81,6 +81,34 @@ class SimulatedDevice {
     _mint(OperationCodec.encode(op));
   }
 
+  /// Author an RGA insert. Stamps the new element with a fresh unique HLC id,
+  /// positioned after [after] (null = list head).
+  void applyInsert(
+    String docId,
+    String listField,
+    Uint8List value, {
+    Hlc? after,
+  }) {
+    _clock = _clock.send(physicalMillis());
+    final op = ListInsert(
+      docId: docId,
+      listField: listField,
+      id: _clock,
+      after: after,
+      value: value,
+    );
+    _mint(OperationCodec.encode(op));
+  }
+
+  /// Author an RGA delete (tombstone) for [elementId].
+  void applyRemoveListItem(String docId, String listField, Hlc elementId) {
+    _mint(OperationCodec.encode(ListDelete(
+      docId: docId,
+      listField: listField,
+      elementId: elementId,
+    )));
+  }
+
   void _mint(Uint8List payload) {
     final op = Op(id, _seq++, payload);
     _add(op);

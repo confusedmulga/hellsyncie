@@ -23,6 +23,8 @@ class OperationCodec {
   static const int _typeMapPut = 1;
   static const int _typeSetAdd = 2;
   static const int _typeSetRemove = 3;
+  static const int _typeListInsert = 4;
+  static const int _typeListDelete = 5;
 
   static Uint8List encode(Operation op) {
     final w = _Writer()..u8(version);
@@ -51,6 +53,27 @@ class OperationCodec {
         for (final t in o.observedTags) {
           w.hlc(t);
         }
+      case final ListInsert o:
+        w
+          ..u8(_typeListInsert)
+          ..str(o.docId)
+          ..str(o.listField)
+          ..hlc(o.id);
+        final after = o.after;
+        if (after == null) {
+          w.u8(0);
+        } else {
+          w
+            ..u8(1)
+            ..hlc(after);
+        }
+        w.bytes(o.value);
+      case final ListDelete o:
+        w
+          ..u8(_typeListDelete)
+          ..str(o.docId)
+          ..str(o.listField)
+          ..hlc(o.elementId);
     }
     return w.take();
   }
@@ -89,6 +112,28 @@ class OperationCodec {
           setField: setField,
           element: element,
           observedTags: tags,
+        );
+      case _typeListInsert:
+        final docId = r.str();
+        final listField = r.str();
+        final id = r.hlc();
+        final after = r.u8() == 1 ? r.hlc() : null;
+        final value = r.bytes();
+        return ListInsert(
+          docId: docId,
+          listField: listField,
+          id: id,
+          after: after,
+          value: value,
+        );
+      case _typeListDelete:
+        final docId = r.str();
+        final listField = r.str();
+        final elementId = r.hlc();
+        return ListDelete(
+          docId: docId,
+          listField: listField,
+          elementId: elementId,
         );
       default:
         throw FormatException('unknown operation type $type');

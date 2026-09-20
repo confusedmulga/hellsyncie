@@ -1,6 +1,8 @@
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:sync_engine/sync_engine.dart';
+
 import 'simulated_backend.dart';
 import 'simulated_device.dart';
 
@@ -81,13 +83,29 @@ Future<FuzzResult> runFuzz(int seed, {FuzzConfig? config}) async {
       // Local op over a small doc/field/element space, so devices contend and
       // merge order matters: LWW put, OR-set add, or OR-set remove.
       final docId = 'doc${rng.nextInt(3)}';
-      switch (rng.nextInt(3)) {
+      switch (rng.nextInt(5)) {
         case 0:
           dev.applyPut(docId, 'f${rng.nextInt(5)}', _randomPayload(rng));
         case 1:
           dev.applyAdd(docId, 'tags', _element(rng));
-        default:
+        case 2:
           dev.applyRemove(docId, 'tags', _element(rng));
+        case 3:
+          // RGA insert at head or after a random existing element.
+          final ids = CrdtEngine.elementIds(dev.log, docId, 'items');
+          final after = ids.isEmpty || rng.nextBool()
+              ? null
+              : ids[rng.nextInt(ids.length)];
+          dev.applyInsert(docId, 'items', _randomPayload(rng), after: after);
+        default:
+          // RGA delete of a random existing element, else insert instead.
+          final ids = CrdtEngine.elementIds(dev.log, docId, 'items');
+          if (ids.isEmpty) {
+            dev.applyInsert(docId, 'items', _randomPayload(rng));
+          } else {
+            dev.applyRemoveListItem(
+                docId, 'items', ids[rng.nextInt(ids.length)]);
+          }
       }
     } else if (roll < 85) {
       await dev.sync(backend); // real merge round
