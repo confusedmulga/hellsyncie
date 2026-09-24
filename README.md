@@ -80,7 +80,7 @@ Read this before writing code against it. Sections are numbered. Notes marked
 4.1 Build order is deliberate. The test harness is built BEFORE the sync engine.
     The harness is a torture chamber; the engine is built inside it.
 
-4.2 Stage 1 - SHIPPED IN THIS BUILD:
+4.2 Stage 1 - SHIPPED: the harness.
     - The storage contract (`Backend`: list, download, upload, delete).
     - The versioned, checksummed change-file format.
     - A simulated backend that injects five real storage faults on demand.
@@ -88,11 +88,20 @@ Read this before writing code against it. Sections are numbered. Notes marked
     - A deterministic fuzzer: N devices, random changes, random sync order,
       random faults - one seed reproduces an entire run exactly.
 
-4.3 Stage 2 - LATER BUILDS: the CRDT engine (the merge logic) and the concrete
-    storage backends (plain folder, Google Drive). The engine slots in behind
-    one interface, `SyncEngine`, which the harness already calls.
+4.3 Stage 2 - SHIPPED: the CRDT engine (the merge logic), behind one
+    interface, `SyncEngine`.
+    - Hybrid logical clock for ordering.
+    - LWW-register maps, OR-sets (add-wins), RGA ordered lists.
+    - The fuzzer asserts byte-identical MERGED state on every device.
 
-4.4 Testing doctrine (hard rules, see `CLAUDE.md`):
+4.4 Stage 3 - IN PROGRESS: real storage backends.
+    - `sync_backend_fs` - plain or desktop-synced folder, atomic writes.
+      SHIPPED.
+    - `sync_backend_drive` - Google Drive appDataFolder. Next.
+
+    **NOTE** Live build status is kept in `sync_engine/docs/ROADMAP.md`.
+
+4.5 Testing doctrine (hard rules, see `CLAUDE.md`):
     - Every engine change runs the fuzz suite: 1,000 seeds per change.
     - A failing seed means a real bug. Fix the engine. Never weaken the
       convergence check. Never delete a failing assertion.
@@ -121,6 +130,10 @@ dart pub get
 ```bash
 dart test
 ```
+
+    Run the folder-backend tests (contract + multi-replica convergence over a
+    real shared folder) the same way, from
+    `sync_engine/packages/sync_backend_fs/`.
 
 5.4 Run the fuzzer directly. From `sync_engine/packages/sync_engine/`:
 
@@ -192,8 +205,9 @@ dart pub global activate melos
 
 ## 8. FLUTTER (ANDROID) INTEGRATION
 
-**NOTE** The runtime engine and Flutter binding ship in a later build (Stage 2,
-per §4.3). The steps below are the TARGET integration - the intended, stable
+**NOTE** The merge engine (Stage 2) and the folder backend (Stage 3a) have
+shipped. The Drive backend (Stage 3b) and the Flutter binding (Stage 5) have
+not, per §4. The steps below are the TARGET integration - the intended, stable
 shape of the API - so an app team can plan against it now. Names may tighten
 before 1.0.
 
@@ -268,9 +282,10 @@ store.changes.listen((_) => setState(() {}));
     **NOTE** Sync is safe to call often and safe to interrupt. A killed sync
     loses nothing; the local log is durable and the next round resumes.
 
-8.7 What you can do TODAY, before Stage 2: run the engine's simulation harness
-    (§5) to understand the guarantees, and design your document model against
-    the CRDT types in §3.2 and `docs/DESIGN.md`.
+8.7 What you can do TODAY: run the engine's test suite and fuzzer (§5) to see
+    the guarantees, and design your document model against the CRDT types in
+    §3.2 and `docs/DESIGN.md`. The storage layer (`sync_backend_fs`) is ready;
+    the device-side sync loop is not yet exposed as a public API.
 
 ---
 
@@ -281,14 +296,15 @@ hellsyncie/
   README.md                     this file
   CLAUDE.md                     project rules (hard)                  [under sync_engine/]
   docs/DESIGN.md                full design + rejected alternatives   [under sync_engine/]
+  docs/ROADMAP.md               staged build plan + live status       [under sync_engine/]
   docs/session-01-brief.md      original build brief (if preserved)
   sync_engine/                  monorepo (workspace) root
     pubspec.yaml                pub workspace
     melos.yaml                  optional monorepo scripts
     packages/
-      sync_engine/              pure Dart: contract, format, harness  [SHIPPED]
+      sync_engine/              pure Dart: contract, format, engine   [SHIPPED]
       sync_engine_flutter/      Flutter binding                        [stub]
-      sync_backend_fs/          folder backend                         [stub]
+      sync_backend_fs/          folder backend, atomic writes          [SHIPPED]
       sync_backend_drive/       Google Drive backend                   [stub]
 ```
 

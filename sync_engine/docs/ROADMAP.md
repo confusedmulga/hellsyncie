@@ -40,12 +40,23 @@ associative) pass.
 - 2b — OR-set (add-wins).       [DONE 2026-09-21]
 - 2c — RGA (ordered lists).     [DONE 2026-09-21]
 
-## 3. STAGE 3 — REAL BACKENDS.  [parallelizable with Stage 2]
+## 3. STAGE 3 — REAL BACKENDS.  [IN PROGRESS]
 
 COVERS: `sync_backend_fs` (plain/synced folder, atomic writes) first, then
 `sync_backend_drive` (Google Drive `appDataFolder`). Same four methods; must
 honor the same fault tolerances the harness assumes.
 GATE: a real backend drops into the harness / integration tests unchanged.
+
+- 3a — sync_backend_fs (folder, atomic writes).   [DONE 2026-09-24]
+- 3b — sync_backend_drive (Drive appDataFolder).  [NEXT]
+
+NOTE (3a gate): met by a backend contract suite plus a multi-replica
+convergence test — replicas share one real folder, author all five operation
+types, merge through the real `CrdtEngine`, and must be byte-identical. The
+full fault fuzzer still drives `SimulatedBackend` only: its device loop
+(push / pull / confirm-by-readback) lives in the TEST harness, so no other
+package can reuse it. Promoting that loop into `lib/` as a public sync client
+is an open item; see Stage 5.
 
 ## 4. STAGE 4 — COMPACTION + SNAPSHOTS.  [PLAN MODE]
 
@@ -76,6 +87,5 @@ limitation, not a bug).
 
 ---
 
-CURRENT POSITION: Stage 2 complete — HLC + LWW map + OR-set + RGA all merge to
-byte-identical state and are fuzz-green. Next: Stage 3 (real backends) and/or
-Stage 4 (compaction, plan-mode).
+CURRENT POSITION: Stage 2 complete. Stage 3 in progress — 3a (folder backend)
+done and green. Next: 3b (Drive backend), or Stage 4 (compaction, plan-mode).

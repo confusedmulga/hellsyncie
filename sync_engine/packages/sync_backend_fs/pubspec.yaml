@@ -1,12 +1,19 @@
 name: sync_backend_fs
 description: >-
-  Filesystem Backend for the hellsyncie sync engine — a plain folder (local
-  disk or a synced folder such as Dropbox/Drive desktop) via dart:io.
-  STUB — implemented later.
-version: 0.0.0
+  Filesystem Backend for the hellsyncie sync engine — one flat folder on local
+  disk, or a folder kept in sync by a desktop client (Dropbox, Drive, iCloud,
+  Syncthing). Atomic writes; implements the four-method Backend contract.
+version: 0.1.0
 publish_to: none
 
 environment:
   sdk: ^3.6.0
 
 resolution: workspace
+
+dependencies:
+  sync_engine:
+    path: ../sync_engine
+
+dev_dependencies:
+  test: ^1.25.0
