@@ -1,8 +1,9 @@
 /// hellsyncie sync engine — public surface.
 ///
-/// STAGE: scaffold + simulation harness. No CRDT merge logic exists yet; the
-/// engine slots in behind [SyncEngine] in a later build. Everything here is
-/// pure Dart with zero Flutter / Drive / filesystem dependencies.
+/// [SyncClient] is the entry point: it authors CRDT ops into a durable
+/// [LocalStore], syncs them through any [Backend], and materializes merged
+/// state with [CrdtEngine]. Everything here is pure Dart with zero Flutter /
+/// Drive / filesystem dependencies. Test support lives in `testing.dart`.
 library;
 
 export 'src/backend.dart';
@@ -13,7 +14,9 @@ export 'src/crdt_engine.dart';
 export 'src/engine.dart';
 export 'src/format.dart';
 export 'src/hlc.dart';
+export 'src/local_store.dart';
 export 'src/op.dart';
 export 'src/op_codec.dart';
 export 'src/operation.dart';
 export 'src/operation_codec.dart';
+export 'src/sync_client.dart';

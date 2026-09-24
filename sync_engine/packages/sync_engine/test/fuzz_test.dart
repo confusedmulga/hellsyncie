@@ -1,8 +1,7 @@
 import 'dart:math';
 
+import 'package:sync_engine/testing.dart';
 import 'package:test/test.dart';
-
-import 'harness/fuzz_driver.dart';
 
 void main() {
   test(

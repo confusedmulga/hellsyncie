@@ -6,90 +6,27 @@ import 'package:sync_backend_fs/sync_backend_fs.dart';
 import 'package:sync_engine/sync_engine.dart';
 import 'package:test/test.dart';
 
-/// Minimal replica: authors ops into its own op files through a real
-/// [FsBackend] and pulls everyone else's. Transport only — the merge is the
-/// real [CrdtEngine].
-class _Replica {
-  _Replica(this.id, this.backend) : clock = Hlc.zero(id);
-
-  final String id;
-  final Backend backend;
-  final Map<String, Op> log = <String, Op>{};
-  final Set<String> seen = <String>{};
-  Hlc clock;
-  int seq = 0;
-  int tick = 0; // deterministic physical clock
-
-  Future<void> author(Operation Function(Hlc stamp) build) async {
-    clock = clock.send(++tick);
-    final op = Op(id, seq++, OperationCodec.encode(build(clock)));
-    log[op.key] = op;
-    final name = OpFileFormat.fileName(id, op.seq);
-    seen.add(name);
-    await backend.upload(name, OpCodec.encode(op));
-  }
-
-  Future<void> pull() async {
-    for (final f in await backend.list()) {
-      if (seen.contains(f.name)) continue;
-      final Op op;
-      try {
-        op = OpCodec.decode(await backend.download(f.name));
-      } on FormatException {
-        continue; // partial / corrupt: not seen, retried next pull
-      }
-      seen.add(f.name);
-      log.putIfAbsent(op.key, () => op);
-    }
-  }
-
-  Uint8List state() => const CrdtEngine().materialize(log.values);
-}
-
 Uint8List _b(String s) => Uint8List.fromList(s.codeUnits);
 
-Future<void> _randomOp(_Replica r, Random rng) async {
+Future<void> _randomOp(SyncClient c, Random rng) async {
   final doc = 'doc${rng.nextInt(2)}';
-  final values = r.log.values;
   switch (rng.nextInt(5)) {
     case 0:
-      await r.author((h) => MapPut(
-            docId: doc,
-            field: 'f${rng.nextInt(3)}',
-            value: _b('v${rng.nextInt(100)}'),
-            hlc: h,
-          ));
+      await c.put(doc, 'f${rng.nextInt(3)}', _b('v${rng.nextInt(100)}'));
     case 1:
-      final el = _b('t${rng.nextInt(4)}');
-      await r.author(
-          (h) => SetAdd(docId: doc, setField: 'tags', element: el, tag: h));
+      await c.addToSet(doc, 'tags', _b('t${rng.nextInt(4)}'));
     case 2:
-      final el = _b('t${rng.nextInt(4)}');
-      final observed = CrdtEngine.addTagsFor(values, doc, 'tags', el);
-      await r.author((_) => SetRemove(
-            docId: doc,
-            setField: 'tags',
-            element: el,
-            observedTags: observed,
-          ));
+      await c.removeFromSet(doc, 'tags', _b('t${rng.nextInt(4)}'));
     case 3:
-      final ids = CrdtEngine.elementIds(values, doc, 'items');
+      final ids = CrdtEngine.elementIds(c.ops, doc, 'items');
       final after =
           ids.isEmpty || rng.nextBool() ? null : ids[rng.nextInt(ids.length)];
-      final v = _b('i${rng.nextInt(100)}');
-      await r.author((h) => ListInsert(
-            docId: doc,
-            listField: 'items',
-            id: h,
-            after: after,
-            value: v,
-          ));
+      await c.insertIntoList(doc, 'items', _b('i${rng.nextInt(100)}'),
+          after: after);
     default:
-      final ids = CrdtEngine.elementIds(values, doc, 'items');
+      final ids = CrdtEngine.elementIds(c.ops, doc, 'items');
       if (ids.isEmpty) return;
-      final target = ids[rng.nextInt(ids.length)];
-      await r.author(
-          (_) => ListDelete(docId: doc, listField: 'items', elementId: target));
+      await c.removeFromList(doc, 'items', ids[rng.nextInt(ids.length)]);
   }
 }
 
@@ -112,42 +49,56 @@ void main() {
         e.deleteSync(recursive: true);
       }
       final rng = Random(seed);
+      var tick = 0; // deterministic physical clock
       final count = 2 + rng.nextInt(3); // 2..4 replicas
-      final replicas = <_Replica>[
+      final replicas = <SyncClient>[
         for (var i = 0; i < count; i++)
-          _Replica('d$i', FsBackend(shared)), // one backend instance each
+          await SyncClient.open(
+            backend: FsBackend(shared), // one backend instance each
+            store: MemoryStore(),
+            deviceId: 'd$i',
+            physicalMillis: () => tick,
+          ),
       ];
 
       for (var step = 0; step < 60; step++) {
+        tick++;
         final r = replicas[rng.nextInt(replicas.length)];
         if (rng.nextInt(10) < 7) {
           await _randomOp(r, rng);
         } else {
-          await r.pull();
+          await r.sync();
         }
       }
-      for (final r in replicas) {
-        await r.pull(); // final drain: the folder is authoritative and honest
+      // Final drain: the folder is authoritative and honest; two passes so the
+      // last replica's push reaches the first.
+      for (var pass = 0; pass < 2; pass++) {
+        for (final r in replicas) {
+          await r.sync();
+        }
       }
 
-      final reference = replicas.first.state();
+      final reference = replicas.first.materialize();
       // Guard against a vacuous pass: real ops were written and merged. (An
       // empty state is still 4 bytes — the zero doc-count header.)
-      expect(replicas.first.log.length, greaterThan(20),
+      expect(replicas.first.ops.length, greaterThan(20),
           reason: 'seed $seed wrote too few ops');
       expect(reference.length, greaterThan(4),
           reason: 'seed $seed materialized nothing');
       for (final r in replicas.skip(1)) {
-        expect(r.state(), reference, reason: 'seed $seed: ${r.id} diverged');
-        expect(r.log.keys.toSet(), replicas.first.log.keys.toSet(),
-            reason: 'seed $seed: ${r.id} op set differs');
+        expect(r.materialize(), reference,
+            reason: 'seed $seed: ${r.deviceId} diverged');
+        expect(r.ops.map((o) => o.key).toSet(),
+            replicas.first.ops.map((o) => o.key).toSet(),
+            reason: 'seed $seed: ${r.deviceId} op set differs');
       }
     }
   });
 
   test('a partially delivered op file is skipped, then picked up whole',
       () async {
-    final reader = _Replica('b', FsBackend(shared));
+    final reader = await SyncClient.open(
+        backend: FsBackend(shared), store: MemoryStore(), deviceId: 'b');
     final op = Op(
       'a',
       0,
@@ -164,12 +115,12 @@ void main() {
 
     // A desktop sync client has delivered only part of device a's file.
     File(path).writeAsBytesSync(full.sublist(0, full.length - 5));
-    await reader.pull();
-    expect(reader.log, isEmpty);
+    await reader.sync();
+    expect(reader.ops, isEmpty);
 
     // The rest arrives.
     File(path).writeAsBytesSync(full);
-    await reader.pull();
-    expect(reader.log.keys, <String>['a#0']);
+    await reader.sync();
+    expect(reader.ops.map((o) => o.key), <String>['a#0']);
   });
 }

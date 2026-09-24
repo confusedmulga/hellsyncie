@@ -1,6 +1,6 @@
+import 'package:sync_engine/testing.dart';
 import 'package:test/test.dart';
 
-import 'harness/fuzz_driver.dart';
 import 'regression_seeds.dart';
 
 /// Runs every pinned regression seed. Auto-discovered by `dart test`.

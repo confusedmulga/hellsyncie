@@ -3,6 +3,7 @@ description: >-
   Filesystem Backend for the hellsyncie sync engine — one flat folder on local
   disk, or a folder kept in sync by a desktop client (Dropbox, Drive, iCloud,
   Syncthing). Atomic writes; implements the four-method Backend contract.
+  Also a durable on-disk LocalStore for the device's own op log.
 version: 0.1.0
 publish_to: none
 

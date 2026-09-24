@@ -45,6 +45,29 @@ sit offline for months. HLC gives causality-consistent ordering with
 bounded drift from physical time. deviceId breaks ties. Never trust
 wall-clock comparison across devices for anything correctness-related.
 
+The clock absorbs (HLC receive) every stamp a device ingests, so an op
+authored after seeing another op always orders after it. Convergence does
+not need this; intent does. Without it a slow-clocked device's later field
+write loses to the write it replaced, and its list insert lands after
+siblings it meant to precede. The fuzzer asserts it on every authored op.
+The clock is not stored: on open it restarts at the highest stamp in the
+local log.
+
+## Device side (SyncClient)
+- Persist before publish: an op reaches the LocalStore before it can be
+  uploaded. Otherwise a crash after upload lets the device reuse that seq
+  for a different op.
+- Confirm by readback: an own op counts as published only when it downloads
+  back with an identical payload. Until then it is re-uploaded every round.
+- Device ids are random per LocalStore and never reused. A wiped store is a
+  new device. Defense in depth for stores that lose their tail anyway: own
+  files found on the backend but missing locally are re-adopted (the seq
+  counter moves past them), and the first round after open pulls before it
+  pushes, so a readback that differs from the local op
+  (DeviceIdCollisionException) stops the device before it overwrites
+  anything. A stale listing can hide the evidence, so this is detection,
+  not a guarantee; unique ids are the guarantee.
+
 ## Storage backend contract
 Four methods: list, download, upload, delete. Everything else lives
 above this line.

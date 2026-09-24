@@ -9,8 +9,7 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'simulated_backend.dart';
-import 'fuzz_driver.dart';
+import 'package:sync_engine/testing.dart';
 
 Future<void> main(List<String> args) async {
   var seed = DateTime.now().millisecondsSinceEpoch & 0x7fffffff;

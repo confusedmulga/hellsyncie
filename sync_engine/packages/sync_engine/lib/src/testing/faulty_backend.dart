@@ -1,7 +1,7 @@
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:sync_engine/sync_engine.dart';
+import '../backend.dart';
 
 /// Fault probabilities, each independently controllable in `[0.0 .. 1.0]`.
 /// All faults are driven from the fuzz run's single seeded RNG, so a seed
@@ -20,7 +20,7 @@ class FaultConfig {
   /// Persist a prefix of the bytes, then surface a failure.
   double truncatedUpload;
 
-  /// Return a `list()` snapshot from [staleDepth] operations ago.
+  /// Return the listing from [staleDepth] `list()` calls ago.
   double staleList;
 
   /// Hide a freshly uploaded file from `list()` for [visibilityDelay] steps.
@@ -42,56 +42,49 @@ class FaultConfig {
   static FaultConfig none() => FaultConfig();
 }
 
-/// In-memory [Backend] that injects the exact failure modes real dumb storage
-/// exhibits. Deterministic: every fault decision is drawn from the injected
-/// [Random], so a seed replays byte-for-byte.
-class SimulatedBackend implements Backend {
-  SimulatedBackend(this._rng, {FaultConfig? faults})
+/// Wraps any [Backend] and makes it exhibit the five lies the contract allows.
+/// Deterministic: every fault decision is drawn from the injected [Random], so
+/// a seed replays the same fault schedule over any inner backend.
+///
+/// Faults are layered ON TOP of [inner], so a real backend sees real partial
+/// writes (a truncated prefix is really uploaded) and the client sees real
+/// stale or duplicated listings of what [inner] actually holds.
+class FaultyBackend implements Backend {
+  FaultyBackend(this.inner, this._rng, {FaultConfig? faults})
       : faults = faults ?? FaultConfig();
 
+  final Backend inner;
   final Random _rng;
   FaultConfig faults;
-
-  final Map<String, Uint8List> _store = <String, Uint8List>{};
 
   /// name -> steps remaining until the file becomes visible to `list()`.
   final Map<String, int> _hiddenFor = <String, int>{};
 
-  /// Recent listing snapshots, newest last. Bounded; only the tail is kept.
+  /// Recent true listings, newest last. Bounded; only the tail is kept.
   final List<List<RemoteFile>> _snapshots = <List<RemoteFile>>[];
   static const int _snapshotWindow = 8;
 
-  int get fileCount => _store.length;
-
   bool _dice(double p) => p > 0 && _rng.nextDouble() < p;
 
-  /// Advance the backend clock: decay visibility timers, record a snapshot.
+  /// Advance the fault clock: decay visibility timers.
   void _tick() {
     _hiddenFor.updateAll((_, v) => v > 0 ? v - 1 : 0);
-    _snapshots.add(_visibleNow());
-    if (_snapshots.length > _snapshotWindow) {
-      _snapshots.removeAt(0);
-    }
-  }
-
-  List<RemoteFile> _visibleNow() {
-    final out = <RemoteFile>[];
-    _store.forEach((name, bytes) {
-      if ((_hiddenFor[name] ?? 0) > 0) return;
-      out.add(RemoteFile(name, bytes.length));
-    });
-    out.sort((a, b) => a.name.compareTo(b.name));
-    return out;
+    _hiddenFor.removeWhere((_, v) => v == 0);
   }
 
   @override
   Future<List<RemoteFile>> list() async {
     _tick();
-    List<RemoteFile> base;
+    final visible = <RemoteFile>[
+      for (final f in await inner.list())
+        if (!_hiddenFor.containsKey(f.name)) f,
+    ];
+    _snapshots.add(visible);
+    if (_snapshots.length > _snapshotWindow) _snapshots.removeAt(0);
+
+    var base = visible;
     if (_dice(faults.staleList) && _snapshots.length > faults.staleDepth) {
       base = _snapshots[_snapshots.length - 1 - faults.staleDepth];
-    } else {
-      base = _visibleNow();
     }
     final result = List<RemoteFile>.of(base);
     if (_dice(faults.duplicateDelivery) && result.isNotEmpty) {
@@ -101,40 +94,36 @@ class SimulatedBackend implements Backend {
   }
 
   @override
-  Future<Uint8List> download(String name) async {
-    final bytes = _store[name];
-    if (bytes == null) {
-      throw StateError('download: no such file: $name');
-    }
-    return Uint8List.fromList(bytes);
-  }
+  Future<Uint8List> download(String name) => inner.download(name);
 
   @override
   Future<void> upload(String name, Uint8List bytes) async {
     _tick();
     if (_dice(faults.droppedUpload)) {
-      // Report success, persist nothing.
-      return;
+      return; // Report success, persist nothing.
     }
     if (_dice(faults.truncatedUpload) && bytes.length > 1) {
       final cut = 1 + _rng.nextInt(bytes.length - 1);
-      _store[name] = Uint8List.fromList(bytes.sublist(0, cut));
+      await inner.upload(name, Uint8List.fromList(bytes.sublist(0, cut)));
       _armVisibility(name);
       throw StateError('upload truncated: $name');
     }
-    _store[name] = Uint8List.fromList(bytes);
+    await inner.upload(name, bytes);
     _armVisibility(name);
   }
 
   void _armVisibility(String name) {
-    _hiddenFor[name] =
-        _dice(faults.delayedVisibility) ? faults.visibilityDelay : 0;
+    if (_dice(faults.delayedVisibility)) {
+      _hiddenFor[name] = faults.visibilityDelay;
+    } else {
+      _hiddenFor.remove(name);
+    }
   }
 
   @override
   Future<void> delete(String name) async {
     _tick();
-    _store.remove(name);
+    await inner.delete(name);
     _hiddenFor.remove(name);
   }
 }

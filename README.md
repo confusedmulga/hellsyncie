@@ -83,8 +83,9 @@ Read this before writing code against it. Sections are numbered. Notes marked
 4.2 Stage 1 - SHIPPED: the harness.
     - The storage contract (`Backend`: list, download, upload, delete).
     - The versioned, checksummed change-file format.
-    - A simulated backend that injects five real storage faults on demand.
-    - A simulated device (durable log, upload-retry, crash/restart).
+    - A fault layer that makes any backend exhibit five real storage faults
+      on demand.
+    - Simulated devices (durable log, upload-retry, crash/restart).
     - A deterministic fuzzer: N devices, random changes, random sync order,
       random faults - one seed reproduces an entire run exactly.
 
@@ -95,7 +96,10 @@ Read this before writing code against it. Sections are numbered. Notes marked
     - The fuzzer asserts byte-identical MERGED state on every device.
 
 4.4 Stage 3 - IN PROGRESS: real storage backends.
-    - `sync_backend_fs` - plain or desktop-synced folder, atomic writes.
+    - `sync_backend_fs` - plain or desktop-synced folder, atomic writes, plus
+      a durable on-disk local store. SHIPPED.
+    - `SyncClient` - the device-side sync loop as a public, pure-Dart API.
+      The fault fuzzer drives it over any backend, the real folder included.
       SHIPPED.
     - `sync_backend_drive` - Google Drive appDataFolder. Next.
 
@@ -131,8 +135,8 @@ dart pub get
 dart test
 ```
 
-    Run the folder-backend tests (contract + multi-replica convergence over a
-    real shared folder) the same way, from
+    Run the folder-backend tests (contract, multi-replica convergence, and
+    100 fault-fuzz seeds over a real shared folder) the same way, from
     `sync_engine/packages/sync_backend_fs/`.
 
 5.4 Run the fuzzer directly. From `sync_engine/packages/sync_engine/`:
@@ -205,9 +209,9 @@ dart pub global activate melos
 
 ## 8. FLUTTER (ANDROID) INTEGRATION
 
-**NOTE** The merge engine (Stage 2) and the folder backend (Stage 3a) have
-shipped. The Drive backend (Stage 3b) and the Flutter binding (Stage 5) have
-not, per §4. The steps below are the TARGET integration - the intended, stable
+**NOTE** The merge engine (Stage 2), the folder backend (Stage 3a), and the
+pure-Dart `SyncClient` have shipped. The Drive backend (Stage 3b) and the
+Flutter binding (Stage 5) have not, per §4. The steps below are the TARGET integration - the intended, stable
 shape of the API - so an app team can plan against it now. Names may tighten
 before 1.0.
 
@@ -282,10 +286,38 @@ store.changes.listen((_) => setState(() {}));
     **NOTE** Sync is safe to call often and safe to interrupt. A killed sync
     loses nothing; the local log is durable and the next round resumes.
 
-8.7 What you can do TODAY: run the engine's test suite and fuzzer (§5) to see
-    the guarantees, and design your document model against the CRDT types in
-    §3.2 and `docs/DESIGN.md`. The storage layer (`sync_backend_fs`) is ready;
-    the device-side sync loop is not yet exposed as a public API.
+8.7 What you can do TODAY, in pure Dart (CLI, desktop, server-side tests):
+
+```dart
+import 'dart:convert';
+import 'dart:io';
+import 'package:sync_backend_fs/sync_backend_fs.dart';
+import 'package:sync_engine/sync_engine.dart';
+
+final client = await SyncClient.open(
+  backend: FsBackend(Directory('/path/to/Dropbox/myapp')), // shared folder
+  store: FsLocalStore(Directory('/path/to/app-data/sync')), // this device
+); // device id: generated once, kept in the store
+
+await client.put('note:42', 'title', utf8.encode('Groceries'));
+final milk = await client.insertIntoList('note:42', 'items', utf8.encode('Milk'));
+await client.insertIntoList('note:42', 'items', utf8.encode('Eggs'), after: milk);
+await client.sync(); // push, pull, confirm by readback
+```
+
+    **WARNING** Never copy a local store directory to another device. The
+    device id inside must stay unique to one install.
+
+    **NOTE** Reading state back is not yet typed: `materialize()` returns the
+    canonical merged bytes. A structured read API is an open roadmap item.
+
+    Writing a backend of your own? Prove it under the same fault fuzzer:
+
+```dart
+import 'package:sync_engine/testing.dart';
+
+final result = await runFuzz(seed, backend: MyBackend(emptyStorage));
+```
 
 ---
 
@@ -302,9 +334,10 @@ hellsyncie/
     pubspec.yaml                pub workspace
     melos.yaml                  optional monorepo scripts
     packages/
-      sync_engine/              pure Dart: contract, format, engine   [SHIPPED]
+      sync_engine/              pure Dart: contract, format, engine,  [SHIPPED]
+                                SyncClient; testing.dart = fuzzer
       sync_engine_flutter/      Flutter binding                        [stub]
-      sync_backend_fs/          folder backend, atomic writes          [SHIPPED]
+      sync_backend_fs/          folder backend + on-disk local store   [SHIPPED]
       sync_backend_drive/       Google Drive backend                   [stub]
 ```
 

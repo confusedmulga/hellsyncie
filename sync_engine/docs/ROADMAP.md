@@ -48,15 +48,40 @@ honor the same fault tolerances the harness assumes.
 GATE: a real backend drops into the harness / integration tests unchanged.
 
 - 3a — sync_backend_fs (folder, atomic writes).   [DONE 2026-09-24]
-- 3b — sync_backend_drive (Drive appDataFolder).  [NEXT]
+- 3s — public SyncClient + fuzz any Backend.      [DONE 2026-09-24]
+- 3b — sync_backend_drive (Drive appDataFolder).  [NEXT — needs dep approval]
 
 NOTE (3a gate): met by a backend contract suite plus a multi-replica
 convergence test — replicas share one real folder, author all five operation
-types, merge through the real `CrdtEngine`, and must be byte-identical. The
-full fault fuzzer still drives `SimulatedBackend` only: its device loop
-(push / pull / confirm-by-readback) lives in the TEST harness, so no other
-package can reuse it. Promoting that loop into `lib/` as a public sync client
-is an open item; see Stage 5.
+types, merge through the real `CrdtEngine`, and must be byte-identical.
+
+NOTE (3s): the device loop (push / pull / confirm-by-readback) moved out of the
+test harness into `lib/` as `SyncClient`, over a durable `LocalStore`. The five
+faults moved into `FaultyBackend`, a decorator over ANY backend, exported with
+the fuzzer from `package:sync_engine/testing.dart`. The fuzzer now drives real
+`SyncClient`s, and a crash reopens the client from its store — the production
+recovery path. `FsBackend` runs under the full fault fuzzer (100 seeds per
+change) and `FsLocalStore` gives apps a durable on-disk store. New fuzz oracle:
+an authored stamp must order after every stamp the device holds. The old loop
+never advanced its HLC on receive and violated this in 1,000 of 1,000 seeds —
+convergence held, but under clock skew a later edit could lose to the one it
+replaced. Fixed: the clock absorbs every ingested stamp.
+
+OPEN (found in 3s, not yet fixed):
+- HLC drift bound. `receive` trusts remote wall time; one device with a clock
+  years ahead drags every device's HLC there permanently. Needs a max-drift
+  guard (reject or clamp) — a merge-adjacent change, so plan mode.
+- Restart cost. On open every own op is re-verified by download (that is what
+  repairs a backend that lost files). O(own ops) per app start until
+  compaction (Stage 4) bounds the log, or a persisted confirmation watermark.
+- No structured read API. `materialize()` returns canonical bytes, good for
+  convergence checks and useless to an app. A typed read model over the fold
+  is needed before Stage 5 — it touches the engine, so plan mode.
+- Newer operation versions are skipped silently at materialize; DESIGN says
+  refuse and surface "update the app".
+- 3b: Drive allows two files with one name. The Drive backend must upsert by
+  name (update the existing file id); otherwise every re-push adds a copy and
+  `download(name)` has no single answer.
 
 ## 4. STAGE 4 — COMPACTION + SNAPSHOTS.  [PLAN MODE]
 
@@ -88,4 +113,6 @@ limitation, not a bug).
 ---
 
 CURRENT POSITION: Stage 2 complete. Stage 3 in progress — 3a (folder backend)
-done and green. Next: 3b (Drive backend), or Stage 4 (compaction, plan-mode).
+and 3s (public SyncClient; fault fuzzer runs over real backends) done and
+green. Next: 3b (Drive backend, blocked on dependency approval), or Stage 4
+(compaction, plan-mode).

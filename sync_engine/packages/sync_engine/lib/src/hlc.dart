@@ -23,9 +23,11 @@ class Hlc implements Comparable<Hlc> {
     return Hlc(wallMillis, counter + 1, deviceId);
   }
 
-  /// Advance on RECEIVING [remote], keeping this device's id. Not needed for LWW
-  /// convergence (the winner is the global max over the op set), but kept for
-  /// causal hygiene and used from later slices.
+  /// Advance on RECEIVING [remote], keeping this device's id. The result orders
+  /// after both this clock and [remote]. Convergence does not need it (the LWW
+  /// winner is the global max over the op set); intent does: `SyncClient`
+  /// calls it on every pull so an op authored after seeing [remote] orders
+  /// after it, however skewed the wall clocks.
   Hlc receive(Hlc remote, int physicalNow) {
     final maxWall = max(max(wallMillis, remote.wallMillis), physicalNow);
     final int c;
