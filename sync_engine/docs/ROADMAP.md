@@ -123,8 +123,8 @@ DECIDED (owner, 2026-09-24):
   a device silent > 180 days stops blocking.
 
 - 4a — incremental, joinable CrdtState.          [DONE 2026-09-24]
-- 4b — snapshots + local compaction.             [NEXT]
-- 4c — cursors, remote deletion, sleeper devices.
+- 4b — snapshots + local compaction.             [DONE 2026-09-24]
+- 4c — cursors, remote deletion, sleeper devices. [NEXT]
 - 4d — compaction over fs + Drive fuzz; docs.
 
 NOTE (4a): `CrdtState` folds ops incrementally and joins with other states;
@@ -134,6 +134,20 @@ random histories. Join is proven commutative, associative, idempotent, and
 equal to the fold of the union, including after pruning and a codec round
 trip. SyncClient no longer re-folds the log per call or rescans it per edit.
 The fuzzer also asserts incremental state == a fresh fold of each log.
+
+NOTE (4b): `snap_<id>_<gen>.bin` (magic HSS1, versioned, CRC) carries a
+writer's full state and its cut vector. `SyncClient.compact()` saves it as the
+local snapshot, drops covered pulled ops from the store, and publishes it,
+confirmed by readback. Pull joins each writer's newest readable snapshot
+BEFORE fetching ops, so a new device downloads the snapshot plus the tail,
+not the history. Gens persist before upload and are never reused. Own ops stay
+in the local log until 4c deletes them remotely. Fuzz: a compact action (3%
+of steps); coverage-set equality replaces op-log set equality (approved);
+every store must reopen to the state its device holds. Logs shrank in 299 of
+300 seeds. Mutants caught: join skipping the state, open ignoring the local
+snapshot, local compaction shedding own ops. Limitation until 4c: no op file
+is ever deleted from the backend, so a device that loses track of snapshot
+coverage can heal by re-downloading — some snapshot bugs only show in 4c.
 
 ## 5. STAGE 5 — FLUTTER BINDING.
 

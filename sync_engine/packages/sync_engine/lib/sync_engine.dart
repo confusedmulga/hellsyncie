@@ -20,4 +20,5 @@ export 'src/op.dart';
 export 'src/op_codec.dart';
 export 'src/operation.dart';
 export 'src/operation_codec.dart';
+export 'src/snapshot.dart';
 export 'src/sync_client.dart';

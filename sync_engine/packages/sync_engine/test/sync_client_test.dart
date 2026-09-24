@@ -39,11 +39,18 @@ class _FlakyStore extends MemoryStore {
 /// Counts list() calls.
 class _CountingBackend extends MemoryBackend {
   int lists = 0;
+  final List<String> downloads = <String>[];
 
   @override
   Future<List<RemoteFile>> list() {
     lists++;
     return super.list();
+  }
+
+  @override
+  Future<Uint8List> download(String name) {
+    downloads.add(name);
+    return super.download(name);
   }
 }
 
@@ -271,6 +278,152 @@ void main() {
     expect(backend.lists, 3);
     expect(results.every((r) => r.pending == 0), isTrue);
     expect(c.ops, hasLength(1));
+  });
+
+  group('compaction', () {
+    test('folds pulled ops into a snapshot; state and reopen unchanged',
+        () async {
+      final backend = MemoryBackend();
+      final store = MemoryStore();
+      final a = await _open(backend, id: 'a', store: store);
+      final b = await _open(backend, id: 'b');
+      for (var i = 0; i < 5; i++) {
+        await b.put('d', 'f$i', _b('v$i'));
+      }
+      await b.addToSet('d', 'tags', _b('x'));
+      await b.sync();
+      await a.put('d', 'mine', _b('own'));
+      await a.sync();
+      final before = a.materialize();
+      expect(a.ops, hasLength(7));
+
+      final result = await a.compact();
+      expect(result.pending, 0, reason: 'snapshot confirmed by readback');
+      expect(a.confirmedSnapshotGen, 1);
+      expect(a.ops.map((o) => o.key), <String>['a#0'], reason: 'own op kept');
+      expect(a.frontier, <String, int>{'a': 1, 'b': 6});
+      expect(a.materialize(), before);
+      expect((await store.loadOps()).map((o) => o.key), <String>['a#0']);
+
+      final reopened = await _open(backend, id: 'a', store: store);
+      expect(reopened.materialize(), before);
+      expect(reopened.frontier, a.frontier);
+      // Removing an element seen only through the snapshot still works.
+      await reopened.removeFromSet('d', 'tags', _b('x'));
+      expect(_text(reopened.materialize()), isNot(contains('x')));
+    });
+
+    test('a new device joins the snapshot instead of downloading its ops',
+        () async {
+      final backend = _CountingBackend();
+      final a = await _open(backend, id: 'a');
+      for (var i = 0; i < 4; i++) {
+        await a.put('d', 'f$i', _b('v$i'));
+      }
+      await a.compact();
+      await a.put('d', 'late', _b('tail'));
+      await a.sync();
+
+      backend.downloads.clear();
+      final c = await _open(backend, id: 'c');
+      final result = await c.sync();
+      expect(result.received, 2, reason: 'one snapshot + one tail op');
+      expect(backend.downloads, <String>['snap_a_1.bin', 'ops_a_4.bin']);
+      expect(c.materialize(), a.materialize());
+      expect(c.frontier, <String, int>{'a': 5});
+    });
+
+    test('an unreadable newest snapshot falls back to the older gen', () async {
+      final backend = MemoryBackend();
+      final a = await _open(backend, id: 'a');
+      await a.put('d', 'f', _b('v'));
+      await a.compact();
+      final good = await backend.download('snap_a_1.bin');
+      await backend.upload(
+          'snap_a_2.bin', Uint8List.sublistView(good, 0, good.length - 3));
+
+      final c = await _open(backend, id: 'c');
+      await c.sync();
+      expect(c.materialize(), a.materialize());
+      expect(c.frontier, <String, int>{'a': 1});
+    });
+
+    test('a snapshot gen is never reused, even by a reopened store', () async {
+      final backend = MemoryBackend();
+      final store = MemoryStore();
+      var a = await _open(backend, id: 'a', store: store);
+      await a.put('d', 'f', _b('1'));
+      await a.compact();
+      await a.compact();
+      a = await _open(backend, id: 'a', store: store);
+      await a.put('d', 'f', _b('2'));
+      await a.compact();
+      expect(
+          (await backend.list())
+              .map((f) => f.name)
+              .where((n) => n.startsWith('snap_')),
+          <String>['snap_a_1.bin', 'snap_a_2.bin', 'snap_a_3.bin']);
+    });
+
+    test('a store whose snapshot names another device refuses to open',
+        () async {
+      final store = MemoryStore();
+      await store.saveDeviceId('a');
+      await store.saveSnapshot(
+          Snapshot(writer: 'b', gen: 1, cut: const {}, state: CrdtState())
+              .encode());
+      await expectLater(
+          _open(MemoryBackend(), id: 'a', store: store), throwsStateError);
+    });
+  });
+
+  group('Snapshot codec', () {
+    Snapshot sample() {
+      final state = CrdtState()
+        ..apply(MapPut(
+            docId: 'd', field: 'f', value: _b('v'), hlc: const Hlc(9, 1, 'a')));
+      return Snapshot(
+          writer: 'a', gen: 3, cut: const {'a': 4, 'b': 2}, state: state);
+    }
+
+    test('round-trips', () {
+      final bytes = sample().encode();
+      final back = Snapshot.decode(bytes);
+      expect(back.writer, 'a');
+      expect(back.gen, 3);
+      expect(back.cut, <String, int>{'a': 4, 'b': 2});
+      expect(back.state.serialize(), sample().state.serialize());
+      expect(back.encode(), bytes);
+    });
+
+    test('rejects corruption, truncation, and a newer version', () {
+      final bytes = sample().encode();
+      for (var cut = 0; cut < bytes.length; cut++) {
+        expect(() => Snapshot.decode(Uint8List.sublistView(bytes, 0, cut)),
+            throwsFormatException,
+            reason: 'cut at $cut');
+      }
+      final flipped = Uint8List.fromList(bytes)..[bytes.length ~/ 2] ^= 1;
+      expect(() => Snapshot.decode(flipped), throwsFormatException);
+      final newer = Uint8List.fromList(bytes)..[4] = SnapshotFormat.version + 1;
+      expect(
+          () => Snapshot.decode(newer),
+          throwsA(isA<FormatException>()
+              .having((e) => e.message, 'message', contains('update'))));
+    });
+
+    test('names parse only in canonical form', () {
+      expect(SnapshotFormat.parseFileName('snap_a-1_12.bin'),
+          (writer: 'a-1', gen: 12));
+      for (final bad in <String>[
+        'snap_a_01.bin',
+        'snap__1.bin',
+        'ops_a_1.bin',
+        'snap_a_1.bin.tmp',
+      ]) {
+        expect(SnapshotFormat.parseFileName(bad), isNull, reason: bad);
+      }
+    });
   });
 
   group('OpFileFormat.parseFileName', () {

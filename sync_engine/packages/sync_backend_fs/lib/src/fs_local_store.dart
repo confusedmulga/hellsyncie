@@ -1,14 +1,15 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:sync_engine/sync_engine.dart';
 
 import 'fs_backend.dart';
 
 /// A durable [LocalStore] in one directory on local disk: the device id in
-/// `device_id`, and one op file per op under `ops/` — the same checksummed
-/// op-file format the backend carries, written with [FsBackend]'s atomic
-/// temp-file-then-rename.
+/// `device_id`, the local snapshot in `snapshot.bin`, and one op file per op
+/// under `ops/` — the same checksummed formats the backend carries, each
+/// written with [FsBackend]'s atomic temp-file-then-rename.
 ///
 /// Give each install its own directory (on Flutter, under the app's documents
 /// directory) and never copy it to another device: the device id inside must
@@ -28,6 +29,7 @@ class FsLocalStore implements LocalStore {
   final FsBackend _ops;
 
   static const String _deviceIdFile = 'device_id';
+  static const String _snapshotFile = 'snapshot.bin';
 
   @override
   Future<String?> loadDeviceId() async {
@@ -60,6 +62,27 @@ class FsLocalStore implements LocalStore {
     }
     return ops;
   }
+
+  @override
+  Future<void> removeOps(List<Op> ops) async {
+    for (final op in ops) {
+      await _ops.delete(OpFileFormat.fileName(op.deviceId, op.seq));
+    }
+  }
+
+  @override
+  Future<Uint8List?> loadSnapshot() async {
+    try {
+      return await _meta.download(_snapshotFile);
+    } on PathNotFoundException {
+      return null;
+    }
+  }
+
+  /// Atomic: [FsBackend.upload] writes a temp file, then renames it over.
+  @override
+  Future<void> saveSnapshot(Uint8List bytes) =>
+      _meta.upload(_snapshotFile, bytes);
 
   @override
   Future<void> appendOps(List<Op> ops) async {

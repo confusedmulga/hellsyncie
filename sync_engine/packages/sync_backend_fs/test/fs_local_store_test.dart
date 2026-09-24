@@ -39,6 +39,22 @@ void main() {
     expect(ops.single.payload, op.payload);
   });
 
+  test('snapshot saves atomically and ops can be removed', () async {
+    final dir = Directory(path('s'));
+    final store = FsLocalStore(dir);
+    expect(await store.loadSnapshot(), isNull);
+    await store.saveSnapshot(_b('first'));
+    await store.saveSnapshot(_b('second'));
+    expect(await FsLocalStore(dir).loadSnapshot(), _b('second'));
+    expect(dir.listSync().map((e) => e.path.split(RegExp(r'[/\\]')).last),
+        isNot(contains(startsWith('.'))),
+        reason: 'no temp file left behind');
+
+    await store.appendOps(<Op>[Op('a', 0, _b('x')), Op('b', 0, _b('y'))]);
+    await store.removeOps(<Op>[Op('b', 0, _b('y')), Op('z', 9, _b('none'))]);
+    expect((await store.loadOps()).map((o) => o.key), <String>['a#0']);
+  });
+
   test('a corrupt op file is skipped on load', () async {
     final dir = Directory(path('s'));
     final store = FsLocalStore(dir);
@@ -81,5 +97,13 @@ void main() {
     expect(text, allOf(contains('Groceries'), contains('home')));
     expect(text.indexOf('Milk'), lessThan(text.indexOf('Eggs')));
     expect(phone.pendingUploads + laptop.pendingUploads, 0);
+
+    // The laptop compacts; relaunched from disk it still holds everything.
+    await laptop.compact();
+    final state = laptop.materialize();
+    laptop = await launch('laptop');
+    expect(laptop.materialize(), state);
+    expect(laptop.ops.length,
+        lessThan(laptop.frontier.values.reduce((a, b) => a + b)));
   });
 }

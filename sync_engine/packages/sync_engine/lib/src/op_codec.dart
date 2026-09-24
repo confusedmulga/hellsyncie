@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'format.dart';
 import 'op.dart';
+import 'wire.dart';
 
 /// Encodes/decodes an [Op] to the versioned op-file byte layout.
 ///
@@ -31,7 +32,7 @@ class OpCodec {
     final withoutCrc = body.toBytes();
     return (BytesBuilder()
           ..add(withoutCrc)
-          ..add(_u32(_crc32(withoutCrc))))
+          ..add(_u32(crc32(withoutCrc))))
         .toBytes();
   }
 
@@ -68,7 +69,7 @@ class OpCodec {
     off += payloadLen;
 
     final storedCrc = _ru32(data, off);
-    final calcCrc = _crc32(Uint8List.sublistView(data, 0, data.length - 4));
+    final calcCrc = crc32(Uint8List.sublistView(data, 0, data.length - 4));
     if (storedCrc != calcCrc) {
       throw const FormatException('checksum mismatch (corrupt or truncated)');
     }
@@ -96,17 +97,5 @@ class OpCodec {
       v = (v << 8) | d[o + i];
     }
     return v;
-  }
-
-  /// IEEE CRC-32, bytewise (no table).
-  static int _crc32(List<int> bytes) {
-    var crc = 0xFFFFFFFF;
-    for (final b in bytes) {
-      crc ^= b & 0xff;
-      for (var k = 0; k < 8; k++) {
-        crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320 : crc >> 1;
-      }
-    }
-    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
   }
 }

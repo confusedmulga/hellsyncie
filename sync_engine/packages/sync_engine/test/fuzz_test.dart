@@ -9,11 +9,20 @@ void main() {
     () async {
       final meta = Random();
       final failing = <int>[];
+      var compactions = 0, snapshotFiles = 0, prunedDevices = 0;
       for (var i = 0; i < 1000; i++) {
         final seed = meta.nextInt(0x7fffffff);
         final result = await runFuzz(seed);
         if (!result.converged) failing.add(seed);
+        compactions += result.compactions;
+        snapshotFiles += result.snapshotFiles;
+        prunedDevices += result.prunedDevices;
       }
+      // Guard against a vacuous pass: compaction really ran, snapshots landed
+      // on the backend, and logs really shrank into them.
+      expect(compactions, greaterThan(1000));
+      expect(snapshotFiles, greaterThan(500));
+      expect(prunedDevices, greaterThan(500));
       expect(
         failing,
         isEmpty,

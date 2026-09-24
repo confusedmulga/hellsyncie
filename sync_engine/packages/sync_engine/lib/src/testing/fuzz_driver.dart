@@ -2,7 +2,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import '../backend.dart';
-import '../crdt_engine.dart';
+import '../format.dart';
 import '../hlc.dart';
 import '../local_store.dart';
 import '../op.dart';
@@ -25,12 +25,29 @@ class FuzzDevice {
   /// Physical-clock offset the clock-skew action nudges.
   int clockSkewMs = 0;
 
+  /// Ops held individually (the client's log; compaction shrinks it).
   List<Op> get log => client.ops;
   int get logLength => client.ops.length;
 
-  // Causality oracle state: highest stamp in the first [_scanned] log entries.
-  int _scanned = 0;
-  Hlc? _maxHeld;
+  /// Everything this device holds, canonically: `author<count` for each
+  /// contiguous run from seq 0 (in a snapshot or the log), then every key held
+  /// beyond it. Equal coverage = the same op set, however it is stored.
+  List<String> get coverage => _coverage(client);
+
+  int get coverageSize {
+    final frontier = client.frontier;
+    return frontier.values.fold(0, (n, v) => n + v) +
+        client.ops.where((op) => op.seq >= (frontier[op.deviceId] ?? 0)).length;
+  }
+}
+
+List<String> _coverage(SyncClient client) {
+  final frontier = client.frontier;
+  return <String>[
+    for (final MapEntry(key: a, value: n) in frontier.entries) '$a<$n',
+    for (final op in client.ops)
+      if (op.seq >= (frontier[op.deviceId] ?? 0)) op.key,
+  ]..sort();
 }
 
 /// Outcome of a single seeded fuzz run.
@@ -41,6 +58,9 @@ class FuzzResult {
     required this.devices,
     required this.drainRounds,
     this.failureReason,
+    this.compactions = 0,
+    this.snapshotFiles = 0,
+    this.prunedDevices = 0,
   });
 
   final int seed;
@@ -48,6 +68,16 @@ class FuzzResult {
   final List<FuzzDevice> devices;
   final int drainRounds;
   final String? failureReason;
+
+  /// Compact actions run during the chaos phase.
+  final int compactions;
+
+  /// Snapshot files on the backend at the end.
+  final int snapshotFiles;
+
+  /// Devices whose log ended smaller than their coverage — ops really folded
+  /// away into snapshots, their own or joined.
+  final int prunedDevices;
 }
 
 /// Knobs for a run. Everything else derives from the seed.
@@ -90,12 +120,19 @@ class FuzzConfig {
 }
 
 /// Run one fully deterministic fuzz iteration. The single [seed] fixes device
-/// count, op sequence, sync ordering, and the entire fault schedule.
+/// count, op sequence, sync ordering, compaction, and the entire fault
+/// schedule.
 ///
 /// Devices sync through [backend] (default: a fresh [MemoryBackend]) wrapped
 /// in a [FaultyBackend]. Pass a real backend over EMPTY storage to put it
 /// through the same fault fuzzer; it must be deterministic in listing order
 /// for a seed to replay exactly.
+///
+/// Assertions, in order: quiescence; byte-identical merged state on every
+/// device; identical coverage (the same op set held, as ops or snapshots);
+/// every device's durable store reopens to the state it holds in memory; and,
+/// throughout, causality — every stamp a device mints orders after every op
+/// it holds.
 Future<FuzzResult> runFuzz(
   int seed, {
   FuzzConfig? config,
@@ -103,28 +140,27 @@ Future<FuzzResult> runFuzz(
 }) async {
   final cfg = config ?? FuzzConfig();
   final rng = Random(seed);
-  final faulty =
-      FaultyBackend(backend ?? MemoryBackend(), rng, faults: cfg.faults());
+  final inner = backend ?? MemoryBackend();
+  final faulty = FaultyBackend(inner, rng, faults: cfg.faults());
 
   final deviceCount = 2 + rng.nextInt(7); // 2..8
   final devices = <FuzzDevice>[
     for (var i = 0; i < deviceCount; i++) FuzzDevice._('d$i', MemoryStore()),
   ];
 
+  // Causality oracle: the highest stamp of every op authored in this run.
+  final stampOf = <String, Hlc>{};
+  var compactions = 0;
+
   // Deterministic physical clock: a monotonic base tick plus each device's own
   // skew. Never wall-clock, so a seed reproduces every HLC exactly.
   var physicalTick = 0;
-  Future<void> open(FuzzDevice dev) async {
-    dev
-      ..client = await SyncClient.open(
+  Future<SyncClient> open(FuzzDevice dev) => SyncClient.open(
         backend: faulty,
         store: dev.store,
         deviceId: dev.id,
         physicalMillis: () => physicalTick + dev.clockSkewMs,
-      )
-      .._scanned = 0
-      .._maxHeld = null;
-  }
+      );
 
   FuzzResult fail(String reason, int drainRounds) => FuzzResult(
         seed: seed,
@@ -132,11 +168,12 @@ Future<FuzzResult> runFuzz(
         devices: devices,
         drainRounds: drainRounds,
         failureReason: reason,
+        compactions: compactions,
       );
 
   try {
     for (final dev in devices) {
-      await open(dev);
+      dev.client = await open(dev);
     }
 
     // --- chaos phase ---
@@ -148,7 +185,8 @@ Future<FuzzResult> runFuzz(
       if (roll < 55) {
         // Local op over a small doc/field/element space, so devices contend
         // and merge order matters.
-        _scan(dev);
+        final held = _maxHeld(dev, stampOf);
+        final logBefore = client.ops.length;
         final docId = 'doc${rng.nextInt(3)}';
         switch (rng.nextInt(5)) {
           case 0:
@@ -175,12 +213,23 @@ Future<FuzzResult> runFuzz(
                   docId, 'items', ids[rng.nextInt(ids.length)]);
             }
         }
-        final violation = _checkCausality(dev);
-        if (violation != null) return fail(violation, 0);
-      } else if (roll < 85) {
+        for (final op in client.ops.skip(logBefore)) {
+          final (:minted, :max) = _stamps(op);
+          if (max != null) stampOf[op.key] = max;
+          if (minted != null && held != null && minted.compareTo(held) <= 0) {
+            return fail(
+                'causality: device ${dev.id} minted $minted, not after held '
+                'stamp $held',
+                0);
+          }
+        }
+      } else if (roll < 82) {
         await client.sync(); // real merge round
+      } else if (roll < 85) {
+        await client.compact(); // snapshot, shed covered ops, publish
+        compactions++;
       } else if (roll < 95) {
-        await open(dev); // crash: drop the client, reopen from the store
+        dev.client = await open(dev); // crash: reopen from the store
       } else {
         dev.clockSkewMs += rng.nextInt(2001) - 1000; // +/- 1s skew
       }
@@ -194,7 +243,7 @@ Future<FuzzResult> runFuzz(
     var quiescent = false;
     var rounds = 0;
     for (; rounds < cfg.maxDrainRounds; rounds++) {
-      final before = _totalLog(devices);
+      final before = _totalCoverage(devices);
       // Two passes, so a file the last device pushes reaches the first.
       for (var pass = 0; pass < 2; pass++) {
         for (final d in devices) {
@@ -202,26 +251,17 @@ Future<FuzzResult> runFuzz(
         }
       }
       final pending = devices.fold(0, (n, d) => n + d.client.pendingUploads);
-      if (_totalLog(devices) == before && pending == 0) {
+      if (_totalCoverage(devices) == before && pending == 0) {
         quiescent = true;
         rounds++;
         break;
       }
     }
 
-    // --- convergence assertion ---
+    // --- convergence assertions ---
     if (!quiescent) {
       return fail(
           'not quiescent after ${cfg.maxDrainRounds} drain rounds', rounds);
-    }
-    // The incrementally maintained state must equal a fresh fold of the log.
-    for (final d in devices) {
-      if (!_bytesEqual(d.client.materialize(), _fold.materialize(d.log))) {
-        return fail(
-            'device ${d.id} incremental state differs from a fresh fold of '
-            'its own log',
-            rounds);
-      }
     }
     final reference = devices.first.client.materialize();
     for (final d in devices.skip(1)) {
@@ -234,21 +274,40 @@ Future<FuzzResult> runFuzz(
       }
     }
 
-    // Secondary invariant: identical op-log SETS (transport completeness).
-    final refKeys = _opKeys(devices.first);
+    // Secondary invariant: identical coverage (transport completeness). With
+    // nothing compacted this is exactly op-log set equality.
+    final refCoverage = devices.first.coverage;
     for (final d in devices.skip(1)) {
-      if (!_listEqualString(refKeys, _opKeys(d))) {
+      if (!_listEqualString(refCoverage, d.coverage)) {
         return fail(
-            'device ${d.id} op-log set differs from ${devices.first.id}',
-            rounds);
+            'device ${d.id} coverage differs from ${devices.first.id}', rounds);
       }
     }
 
+    // Durability: what each store holds reopens to what the device holds.
+    for (final d in devices) {
+      final reopened = await open(d);
+      if (!_bytesEqual(reopened.materialize(), d.client.materialize())) {
+        return fail(
+            'device ${d.id}: store reopens to a different state', rounds);
+      }
+      if (!_listEqualString(_coverage(reopened), d.coverage)) {
+        return fail(
+            'device ${d.id}: store reopens to a different coverage', rounds);
+      }
+    }
+
+    final snapshotFiles = (await inner.list())
+        .where((f) => SnapshotFormat.parseFileName(f.name) != null)
+        .length;
     return FuzzResult(
       seed: seed,
       converged: true,
       devices: devices,
       drainRounds: rounds,
+      compactions: compactions,
+      snapshotFiles: snapshotFiles,
+      prunedDevices: devices.where((d) => d.logLength < d.coverageSize).length,
     );
   } on Object catch (e) {
     // Nothing in a fuzz run may throw: the backend's lies are all allowed.
@@ -256,63 +315,51 @@ Future<FuzzResult> runFuzz(
   }
 }
 
-const CrdtEngine _fold = CrdtEngine();
-
-/// Fold the not-yet-scanned tail of [dev]'s log into its highest held stamp.
-void _scan(FuzzDevice dev) {
-  final log = dev.client.ops;
-  for (; dev._scanned < log.length; dev._scanned++) {
-    for (final s in _stampsOf(log[dev._scanned])) {
-      final m = dev._maxHeld;
-      if (m == null || s.compareTo(m) > 0) dev._maxHeld = s;
-    }
+/// The highest stamp among the ops [dev] holds — its coverage — looked up in
+/// the run's own record of what each authored op carried.
+Hlc? _maxHeld(FuzzDevice dev, Map<String, Hlc> stampOf) {
+  Hlc? best;
+  void see(String key) {
+    final s = stampOf[key];
+    if (s != null && (best == null || s.compareTo(best!) > 0)) best = s;
   }
+
+  final frontier = dev.client.frontier;
+  frontier.forEach((author, n) {
+    for (var k = 0; k < n; k++) {
+      see('$author#$k');
+    }
+  });
+  for (final op in dev.client.ops) {
+    if (op.seq >= (frontier[op.deviceId] ?? 0)) see(op.key);
+  }
+  return best;
 }
 
-/// Causality: a stamp minted by a local op must order after every stamp the
-/// device held when it authored it, whatever the wall-clock skew. Otherwise a
-/// later edit can lose to the edit it replaced.
-String? _checkCausality(FuzzDevice dev) {
-  final log = dev.client.ops;
-  final held = dev._maxHeld;
-  for (var i = dev._scanned; i < log.length; i++) {
-    final minted = _mintedStamp(log[i]);
-    if (minted != null && held != null && minted.compareTo(held) <= 0) {
-      return 'causality: device ${dev.id} minted $minted, not after held '
-          'stamp $held';
-    }
-  }
-  _scan(dev);
-  return null;
-}
-
-/// The fresh stamp an op mints, if its type mints one.
-Hlc? _mintedStamp(Op op) => switch (_decode(op)) {
-      MapPut(:final hlc) => hlc,
-      SetAdd(:final tag) => tag,
-      ListInsert(:final id) => id,
-      _ => null,
-    };
-
-/// Every stamp an op carries, minted or referenced.
-List<Hlc> _stampsOf(Op op) => switch (_decode(op)) {
-      MapPut(:final hlc) => <Hlc>[hlc],
-      SetAdd(:final tag) => <Hlc>[tag],
-      SetRemove(:final observedTags) => observedTags,
-      ListInsert(:final id, :final after) => <Hlc>[
-          id,
-          if (after != null) after
-        ],
-      ListDelete(:final elementId) => <Hlc>[elementId],
-      null => const <Hlc>[],
-    };
-
-Operation? _decode(Op op) {
+/// The stamp an op mints (if its type mints one), and the highest stamp it
+/// carries, minted or referenced.
+({Hlc? minted, Hlc? max}) _stamps(Op op) {
+  final Operation o;
   try {
-    return OperationCodec.decode(op.payload);
+    o = OperationCodec.decode(op.payload);
   } on FormatException {
-    return null;
+    return (minted: null, max: null);
   }
+  final (Hlc? minted, List<Hlc> all) = switch (o) {
+    MapPut(:final hlc) => (hlc, <Hlc>[hlc]),
+    SetAdd(:final tag) => (tag, <Hlc>[tag]),
+    SetRemove(:final observedTags) => (null, observedTags),
+    ListInsert(:final id, :final after) => (
+        id,
+        <Hlc>[id, if (after != null) after]
+      ),
+    ListDelete(:final elementId) => (null, <Hlc>[elementId]),
+  };
+  Hlc? max;
+  for (final s in all) {
+    if (max == null || s.compareTo(max) > 0) max = s;
+  }
+  return (minted: minted, max: max);
 }
 
 Uint8List _randomPayload(Random rng) {
@@ -325,8 +372,8 @@ Uint8List _randomPayload(Random rng) {
 Uint8List _element(Random rng) =>
     Uint8List.fromList('t${rng.nextInt(5)}'.codeUnits);
 
-int _totalLog(List<FuzzDevice> devices) =>
-    devices.fold(0, (n, d) => n + d.logLength);
+int _totalCoverage(List<FuzzDevice> devices) =>
+    devices.fold(0, (n, d) => n + d.coverageSize);
 
 bool _bytesEqual(Uint8List a, Uint8List b) {
   if (a.length != b.length) return false;
@@ -335,9 +382,6 @@ bool _bytesEqual(Uint8List a, Uint8List b) {
   }
   return true;
 }
-
-List<String> _opKeys(FuzzDevice d) =>
-    d.log.map((op) => op.key).toList()..sort();
 
 bool _listEqualString(List<String> a, List<String> b) {
   if (a.length != b.length) return false;

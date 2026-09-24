@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Snapshots: `Snapshot` / `SnapshotFormat` (`snap_<id>_<gen>.bin`),
+  `SyncClient.compact()`, snapshot joins on pull (before any op download),
+  `frontier`, `confirmedSnapshotGen`. `SyncClient.ops` is now the log tail.
+- `LocalStore` gains `loadSnapshot` / `saveSnapshot` / `removeOps`.
+- Fuzzer: compaction action; coverage-set equality; reopen-from-store check.
 - `CrdtState`: the merged state, updated one op at a time, joinable with
   another state (state-based CRDT), prunable, and encodable (the future
   snapshot payload). `CrdtEngine` is now a fold into it; rendered output is

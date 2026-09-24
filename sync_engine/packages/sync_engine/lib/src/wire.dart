@@ -11,6 +11,7 @@ class WireWriter {
   final BytesBuilder _b = BytesBuilder();
 
   void u8(int v) => _b.addByte(v & 0xff);
+  void raw(List<int> x) => _b.add(x);
   void u32(int v) => _b.add(<int>[
         (v >> 24) & 0xff,
         (v >> 16) & 0xff,
@@ -89,4 +90,16 @@ class WireReader {
     final id = str();
     return Hlc(wall, counter, id);
   }
+}
+
+/// IEEE CRC-32, bytewise (no table). Guards every file format.
+int crc32(List<int> bytes) {
+  var crc = 0xFFFFFFFF;
+  for (final b in bytes) {
+    crc ^= b & 0xff;
+    for (var k = 0; k < 8; k++) {
+      crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320 : crc >> 1;
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
 }

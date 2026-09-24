@@ -1,12 +1,15 @@
+import 'dart:typed_data';
+
 import 'op.dart';
 
-/// Device-private durable storage behind a `SyncClient`: the device id and
-/// every op the device holds (its own and those pulled from others).
+/// Device-private durable storage behind a `SyncClient`: the device id, the
+/// device's local snapshot (its merged state at a cut), and the ops not folded
+/// into that snapshot — its own, and those pulled from others.
 ///
 /// Unlike a `Backend`, a LocalStore must be HONEST. When a returned future
-/// completes, the write is durable; [loadOps] returns everything appended.
-/// The op log is the only durable sync state: sequence numbers, the clock, and
-/// the upload queue are all rebuilt from it on open.
+/// completes, the write is durable; [loadOps] returns everything appended and
+/// not removed. The snapshot plus the op log are the only durable sync state:
+/// sequence numbers, the clock, and the upload queue are rebuilt from them.
 ///
 /// If a store loses ops anyway (power loss before a rename reaches disk), the
 /// client re-adopts its own files from the backend and detects a reused op
@@ -25,6 +28,17 @@ abstract interface class LocalStore {
   /// that did not persist is downloaded again, and a failed append of a local
   /// op fails the write that authored it.
   Future<void> appendOps(List<Op> ops);
+
+  /// Durably drop [ops] (matched by identity) — called only for ops the saved
+  /// snapshot already covers. Missing ops are ignored.
+  Future<void> removeOps(List<Op> ops);
+
+  /// The last snapshot saved, or null.
+  Future<Uint8List?> loadSnapshot();
+
+  /// Durably and ATOMICALLY replace the snapshot: after a crash, [loadSnapshot]
+  /// returns either the old bytes or the new, never a mix.
+  Future<void> saveSnapshot(Uint8List bytes);
 }
 
 /// A [LocalStore] held in memory. Nothing survives the process; use it for
@@ -44,4 +58,19 @@ class MemoryStore implements LocalStore {
 
   @override
   Future<void> appendOps(List<Op> ops) async => _ops.addAll(ops);
+
+  @override
+  Future<void> removeOps(List<Op> ops) async {
+    final keys = <String>{for (final op in ops) op.key};
+    _ops.removeWhere((op) => keys.contains(op.key));
+  }
+
+  Uint8List? _snapshot;
+
+  @override
+  Future<Uint8List?> loadSnapshot() async => _snapshot;
+
+  @override
+  Future<void> saveSnapshot(Uint8List bytes) async =>
+      _snapshot = Uint8List.fromList(bytes);
 }

@@ -10,6 +10,7 @@ import 'op.dart';
 import 'op_codec.dart';
 import 'operation.dart';
 import 'operation_codec.dart';
+import 'snapshot.dart';
 
 /// Thrown by [SyncClient] when the backend holds a DIFFERENT op under an
 /// identity this device also authored: two stores are writing under one
@@ -33,12 +34,12 @@ class DeviceIdCollisionException implements Exception {
 class SyncResult {
   const SyncResult({required this.received, required this.pending});
 
-  /// Ops ingested from the backend this round. Non-zero means the
-  /// materialized state may have changed.
+  /// Ops and snapshots ingested from the backend this round. Non-zero means
+  /// the materialized state may have changed.
   final int received;
 
-  /// This device's ops not yet confirmed intact on the backend. They are
-  /// re-uploaded every round until a readback matches.
+  /// This device's ops (and snapshot) not yet confirmed intact on the
+  /// backend. They are re-uploaded every round until a readback matches.
   final int pending;
 }
 
@@ -99,7 +100,8 @@ class SyncClient {
       backend,
       store,
       physicalMillis ?? () => DateTime.now().millisecondsSinceEpoch,
-    ).._load(await store.loadOps());
+    );
+    client._load(await store.loadSnapshot(), await store.loadOps());
     return client;
   }
 
@@ -115,8 +117,29 @@ class SyncClient {
   final List<Op> _log = <Op>[];
   final Set<String> _keys = <String>{}; // op keys already in _log
 
-  /// Every op in [_log], folded. Updated as ops arrive, never re-folded.
+  /// Everything held — snapshots joined plus every op in [_log] — folded.
+  /// Updated as ops arrive, never re-folded.
   final CrdtState _state = CrdtState();
+
+  /// Per author, a count of ops covered by a snapshot folded into [_state]:
+  /// every op of that author with a lower seq is held, even if not in [_log].
+  final Map<String, int> _base = <String, int>{};
+
+  /// Highest snapshot gen joined, per writer. A writer's newer gen contains
+  /// everything its older ones did, so older gens are never fetched.
+  final Map<String, int> _joinedGen = <String, int>{};
+
+  /// Highest own snapshot gen used. Persisted in the local snapshot BEFORE a
+  /// gen is uploaded, so a gen number never names two different snapshots.
+  int _gen = 0;
+
+  /// Own snapshot uploaded but not yet confirmed by readback.
+  ({String name, Uint8List bytes, int gen})? _pendingSnapshot;
+
+  /// Highest own snapshot gen confirmed intact on the backend since open.
+  int _confirmedGen = 0;
+
+  bool _compactRequested = false;
 
   /// Own ops not yet confirmed intact on the backend, by file name. Transient:
   /// on open every own op is re-queued, so a backend that lost files is
@@ -135,17 +158,39 @@ class SyncClient {
   Future<SyncResult>? _running;
   Future<SyncResult>? _queued;
 
-  /// Every op this device holds, own and pulled, in local arrival order.
+  /// Ops held individually, in local arrival order: every own op, and pulled
+  /// ops not yet folded into a snapshot. See [frontier] for all that is held.
   List<Op> get ops => List<Op>.unmodifiable(_log);
+
+  /// Per author, how many of its ops this device holds contiguously from seq
+  /// 0 — in a snapshot or in [ops]. Authors with none are omitted.
+  Map<String, int> get frontier {
+    final out = <String, int>{};
+    for (final a in <String>{
+      ..._base.keys,
+      for (final op in _log) op.deviceId
+    }) {
+      var k = _base[a] ?? 0;
+      while (_keys.contains('$a#$k')) {
+        k++;
+      }
+      if (k > 0) out[a] = k;
+    }
+    return out;
+  }
+
+  /// Own snapshot gen confirmed intact on the backend since open; 0 if none.
+  int get confirmedSnapshotGen => _confirmedGen;
 
   /// The device's hybrid logical clock: at or above every stamp it holds.
   Hlc get clock => _clock;
 
-  /// Own ops not yet confirmed on the backend.
-  int get pendingUploads => _unconfirmed.length;
+  /// Own ops (and snapshot) not yet confirmed on the backend.
+  int get pendingUploads =>
+      _unconfirmed.length + (_pendingSnapshot == null ? 0 : 1);
 
-  /// The merged state: a pure fold over every op held. Byte-identical on
-  /// every device holding the same op set.
+  /// The merged state of everything held. Byte-identical on every device
+  /// holding the same op set, whether as ops or folded into snapshots.
   Uint8List materialize() => _state.serialize();
 
   /// Ids of every element ever inserted into the list [listField] of [docId],
@@ -260,12 +305,25 @@ class SyncClient {
     );
   }
 
+  /// A sync round that also compacts: saves the whole state as the local
+  /// snapshot, drops the pulled ops it covers from the local store, and
+  /// publishes it as `snap_<deviceId>_<gen>` — confirmed, like ops, only by
+  /// reading it back intact.
+  Future<SyncResult> compact() {
+    _compactRequested = true;
+    return sync();
+  }
+
   Future<SyncResult> _round() async {
     var received = 0;
     if (!_pulledSinceOpen) received += await _pull();
+    if (_compactRequested) {
+      _compactRequested = false;
+      await _exclusive(_publishSnapshot);
+    }
     await _push();
     received += await _pull();
-    return SyncResult(received: received, pending: _unconfirmed.length);
+    return SyncResult(received: received, pending: pendingUploads);
   }
 
   Future<void> _push() async {
@@ -277,26 +335,66 @@ class SyncClient {
         // Failed or truncated: stays unconfirmed, re-pushed next round.
       }
     }
+    final snap = _pendingSnapshot;
+    if (snap != null) {
+      try {
+        await _backend.upload(snap.name, snap.bytes);
+      } on Object {
+        // Re-pushed next round.
+      }
+    }
   }
 
-  /// List; confirm own uploads by readback; download unseen op files; ingest.
+  /// List; join the newest unjoined snapshot of each writer; confirm own
+  /// uploads by readback; download the op files no snapshot covers; ingest.
   Future<int> _pull() async {
-    final listing = await _backend.list();
+    final names = <String>{for (final f in await _backend.list()) f.name};
+
+    // Snapshots first, so the op files they cover are never downloaded.
+    final unjoined = <String, List<int>>{}; // writer -> gens newer than joined
+    for (final name in names) {
+      final snap = SnapshotFormat.parseFileName(name);
+      if (snap == null) continue;
+      if (snap.writer == deviceId && snap.gen > _gen) _gen = snap.gen;
+      if (name == _pendingSnapshot?.name) {
+        await _confirmSnapshot();
+      } else if (snap.gen > (_joinedGen[snap.writer] ?? 0)) {
+        (unjoined[snap.writer] ??= <int>[]).add(snap.gen);
+      }
+    }
+    // Newest first: it holds everything older gens did. Fall back only if it
+    // is unreadable (a truncated upload its writer has not yet replaced).
+    final snapshots = <Snapshot>[];
+    final covered = Map<String, int>.of(_base);
+    for (final MapEntry(key: writer, value: gens) in unjoined.entries) {
+      gens.sort((a, b) => b.compareTo(a));
+      for (final gen in gens) {
+        final s = await _fetchSnapshot(writer, gen);
+        if (s == null) continue;
+        snapshots.add(s);
+        s.cut.forEach((a, n) {
+          if (n > (covered[a] ?? 0)) covered[a] = n;
+        });
+        break;
+      }
+    }
+
     final fetched = <Op>[];
-    for (final name in <String>{for (final f in listing) f.name}) {
+    for (final name in names) {
       final id = OpFileFormat.parseFileName(name);
-      if (id == null) continue; // not an op file
+      if (id == null) continue;
       final mine = _unconfirmed[name];
       if (mine != null) {
         await _confirm(name, mine);
-      } else if (!_keys.contains('${id.deviceId}#${id.seq}')) {
+      } else if (id.seq >= (covered[id.deviceId] ?? 0) &&
+          !_keys.contains('${id.deviceId}#${id.seq}')) {
         // Another device's op — or our own that this store lost; re-adopting
-        // it moves our sequence counter past it so the number is never reused.
+        // it moves our sequence counter past it so it is never reused.
         final op = await _fetch(name, '${id.deviceId}#${id.seq}');
         if (op != null) fetched.add(op);
       }
     }
-    final received = await _ingest(fetched);
+    final received = await _ingest(fetched, snapshots);
     _pulledSinceOpen = true;
     return received;
   }
@@ -315,6 +413,19 @@ class SyncClient {
     _unconfirmed.remove(name);
   }
 
+  Future<void> _confirmSnapshot() async {
+    final pending = _pendingSnapshot!;
+    try {
+      if (!_bytesEqual(await _backend.download(pending.name), pending.bytes)) {
+        return; // truncated or stale: re-pushed next round
+      }
+    } on Object {
+      return;
+    }
+    _pendingSnapshot = null;
+    if (pending.gen > _confirmedGen) _confirmedGen = pending.gen;
+  }
+
   /// Download and decode [name], or null if unreadable or not the op its name
   /// claims. Skipped files are not remembered, so they are retried next pull.
   Future<Op?> _fetch(String name, String key) async {
@@ -326,42 +437,132 @@ class SyncClient {
     }
   }
 
-  Future<int> _ingest(List<Op> fetched) => _exclusive(() async {
+  Future<Snapshot?> _fetchSnapshot(String writer, int gen) async {
+    try {
+      final s = Snapshot.decode(
+          await _backend.download(SnapshotFormat.fileName(writer, gen)));
+      return s.writer == writer && s.gen == gen ? s : null;
+    } on Object {
+      return null;
+    }
+  }
+
+  Future<int> _ingest(List<Op> fetched, List<Snapshot> snapshots) =>
+      _exclusive(() async {
+        final before = _state.maxStamp;
+        var joined = 0;
+        for (final s in snapshots) {
+          if (s.gen <= (_joinedGen[s.writer] ?? 0)) continue;
+          _state.join(s.state);
+          _raiseBase(s.cut);
+          _joinedGen[s.writer] = s.gen;
+          joined++;
+        }
+        // A snapshot may cover own ops this store lost: never reuse those.
+        _nextSeq = max(_nextSeq, _base[deviceId] ?? 0);
+
         final fresh = <Op>[];
         for (final op in fetched) {
-          if (!_keys.contains(op.key)) {
-            fresh.add(op);
-          } else if (op.deviceId == deviceId) {
-            // Authored locally while this pull ran, yet a different op already
-            // sits under that identity on the backend.
+          if (_keys.contains(op.key)) {
+            if (op.deviceId != deviceId) continue;
+            // Authored locally while this pull ran, yet a different op
+            // already sits under that identity on the backend.
             final own = _log.firstWhere((o) => o.key == op.key);
             if (!_bytesEqual(own.payload, op.payload)) {
               throw DeviceIdCollisionException(
                   deviceId, OpFileFormat.fileName(op.deviceId, op.seq));
             }
+          } else if (!_holds(op.deviceId, op.seq)) {
+            fresh.add(op);
           }
         }
-        if (fresh.isEmpty) return 0;
-        await _store.appendOps(fresh);
-        final before = _state.maxStamp;
-        for (final op in fresh) {
-          _keys.add(op.key);
-          _log.add(op);
-          _state.applyOp(op);
-          if (op.deviceId == deviceId) _nextSeq = max(_nextSeq, op.seq + 1);
+        if (fresh.isNotEmpty) {
+          await _store.appendOps(fresh);
+          for (final op in fresh) {
+            _keys.add(op.key);
+            _log.add(op);
+            _state.applyOp(op);
+            if (op.deviceId == deviceId) _nextSeq = max(_nextSeq, op.seq + 1);
+          }
         }
         final high = _state.maxStamp;
         if (high != null && high != before) {
           _clock = _clock.receive(high, _physicalMillis());
         }
-        return fresh.length;
+        // Make joined knowledge durable, and shed the pulled ops it covers.
+        if (joined > 0) await _saveLocal();
+        return fresh.length + joined;
       });
+
+  // --- snapshots ---
+
+  bool _holds(String author, int seq) =>
+      seq < (_base[author] ?? 0) || _keys.contains('$author#$seq');
+
+  void _raiseBase(Map<String, int> cut) {
+    cut.forEach((author, n) {
+      if (n > (_base[author] ?? 0)) _base[author] = n;
+    });
+  }
+
+  /// Reserve the next gen, persist the state under it, and queue the upload.
+  Future<void> _publishSnapshot() async {
+    _gen++;
+    final bytes = await _saveLocal();
+    _pendingSnapshot = (
+      name: SnapshotFormat.fileName(deviceId, _gen),
+      bytes: bytes,
+      gen: _gen,
+    );
+    _joinedGen[deviceId] = _gen;
+  }
+
+  /// Save the whole state as the local snapshot at the current [frontier],
+  /// then drop the pulled ops it covers from the store and the log. Own ops
+  /// stay: they are re-pushed until confirmed. Returns the snapshot bytes.
+  /// Call inside [_exclusive].
+  Future<Uint8List> _saveLocal() async {
+    final cut = frontier;
+    _state.prune();
+    final bytes =
+        Snapshot(writer: deviceId, gen: _gen, cut: cut, state: _state).encode();
+    await _store.saveSnapshot(bytes);
+    _raiseBase(cut);
+    final covered = <Op>[
+      for (final op in _log)
+        if (op.deviceId != deviceId && op.seq < (_base[op.deviceId] ?? 0)) op,
+    ];
+    if (covered.isNotEmpty) {
+      await _store.removeOps(covered);
+      final gone = <String>{for (final op in covered) op.key};
+      _log.removeWhere((op) => gone.contains(op.key));
+      _keys.removeAll(gone);
+    }
+    return bytes;
+  }
 
   // --- open ---
 
-  void _load(List<Op> stored) {
+  void _load(Uint8List? snapshot, List<Op> stored) {
+    if (snapshot != null) {
+      // An honest store never returns a corrupt snapshot: a decode failure is
+      // surfaced, not papered over.
+      final s = Snapshot.decode(snapshot);
+      if (s.writer != deviceId) {
+        throw StateError('local snapshot belongs to ${s.writer}, not '
+            '$deviceId');
+      }
+      _state.join(s.state);
+      _raiseBase(s.cut);
+      _gen = s.gen;
+      _joinedGen[deviceId] = s.gen;
+      _nextSeq = _base[deviceId] ?? 0;
+    }
     for (final op in stored) {
-      if (!_keys.add(op.key)) continue;
+      if (_keys.contains(op.key)) continue;
+      // Covered pulled ops whose removal a crash interrupted: already folded.
+      if (op.deviceId != deviceId && _holds(op.deviceId, op.seq)) continue;
+      _keys.add(op.key);
       _log.add(op);
       _state.applyOp(op);
       if (op.deviceId == deviceId) {
