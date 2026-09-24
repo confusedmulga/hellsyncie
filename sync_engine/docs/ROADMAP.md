@@ -101,7 +101,7 @@ Still unverified until run on real Drive: 409 on a reused generated id in
 appDataFolder, and modifiedTime ordering of copies. Both are documented API
 behaviour; the fake assumes them.
 
-## 4. STAGE 4 — COMPACTION + SNAPSHOTS.  [IN PROGRESS — plan approved 2026-09-24]
+## 4. STAGE 4 — COMPACTION + SNAPSHOTS.  [DONE 2026-09-24]
 
 COVERS: snapshot + retained op tail (180-day floor); per-device frontier cursor
 files; compaction only past the minimum known frontier; full re-bootstrap for a
@@ -125,7 +125,19 @@ DECIDED (owner, 2026-09-24):
 - 4a — incremental, joinable CrdtState.          [DONE 2026-09-24]
 - 4b — snapshots + local compaction.             [DONE 2026-09-24]
 - 4c — cursors, remote deletion, sleeper devices. [DONE 2026-09-24]
-- 4d — docs; DESIGN amendment.                   [NEXT]
+- 4d — fs/Drive deletion guards; docs.           [DONE 2026-09-24]
+
+OPEN (after Stage 4):
+- Tombstone GC by causal stability (all live cursors cover the removal).
+- Restart cost: on open, snapshots are re-joined (one download per writer)
+  and own ops re-verified. Persist joined gens / a confirmation watermark.
+- Each device keeps one full-state snapshot on the backend: storage is
+  N × state size. Fine for a handful of devices.
+- A device that uploads ops but never completes a round leaves no cursor
+  and blocks remote deletion of others' files until it does (safe; leaks
+  storage).
+- Retention age of removes / list deletes is inferred from the next op
+  that mints a stamp (they carry none of their own).
 
 NOTE (4a): `CrdtState` folds ops incrementally and joins with other states;
 its rendered output is byte-identical to the pre-4a fold, checked against a
@@ -188,8 +200,8 @@ limitation, not a bug).
 
 ---
 
-CURRENT POSITION: Stage 2 complete. Stage 3 in progress — 3a (folder backend)
-and 3s (public SyncClient; fault fuzzer runs over real backends) done and
-green; 3b (Drive backend) built and fuzz-green against a fake Drive. Next:
-verify 3b on real Drive (needs a Cloud project + OAuth client), or Stage 4
-(compaction, plan-mode).
+CURRENT POSITION: Stages 1, 2 and 4 complete. Stage 3: 3a, 3s done; 3b (Drive)
+built and fuzz-green against a fake Drive, real-Drive verification deferred
+by the owner. Next: real-Drive check when credentials exist; Stage 5 (Flutter
+binding) needs the structured read API first (plan mode: touches the
+engine).

@@ -205,6 +205,7 @@ void main() {
         final meta = Random();
         final failing = <String>[];
         final fired = <String, int>{};
+        var deletedOps = 0;
         for (var i = 0; i < 200; i++) {
           final seed = meta.nextInt(0x7fffffff);
           final drive = _fuzzDrive(seed);
@@ -215,6 +216,7 @@ void main() {
           );
           if (!result.converged) failing.add('$seed (${result.failureReason})');
           drive.injected.forEach((k, v) => fired[k] = (fired[k] ?? 0) + v);
+          deletedOps += result.deletedOps;
         }
         // Guard against a vacuous pass: every Drive fault really happened,
         // including creates retried under a reserved id (409 -> update).
@@ -226,6 +228,11 @@ void main() {
         ]) {
           expect(fired[kind] ?? 0, greaterThan(0), reason: '$kind never fired');
         }
+        expect(
+          deletedOps,
+          greaterThan(100),
+          reason: 'compaction deleted files on Drive',
+        );
         expect(
           failing,
           isEmpty,

@@ -14,12 +14,15 @@ void main() {
     () async {
       final meta = Random();
       final failing = <String>[];
+      var deletedOps = 0, compactions = 0;
       for (var i = 0; i < 100; i++) {
         final seed = meta.nextInt(0x7fffffff);
         final dir = await Directory.systemTemp.createTemp('hsy_fs_fuzz_');
         try {
           final result = await runFuzz(seed, backend: FsBackend(dir));
           if (!result.converged) failing.add('$seed (${result.failureReason})');
+          deletedOps += result.deletedOps;
+          compactions += result.compactions;
         } finally {
           await dir.delete(recursive: true);
         }
@@ -31,6 +34,9 @@ void main() {
             'sync_engine/test/regression_seeds.dart and fix the cause, never '
             'the assertion: $failing',
       );
+      // Not vacuous: snapshots were taken and real files really deleted.
+      expect(compactions, greaterThan(50));
+      expect(deletedOps, greaterThan(50));
     },
     timeout: const Timeout(Duration(minutes: 5)),
   );

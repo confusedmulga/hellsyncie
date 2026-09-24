@@ -107,7 +107,17 @@ Read this before writing code against it. Sections are numbered. Notes marked
 
     **NOTE** Live build status is kept in `sync_engine/docs/ROADMAP.md`.
 
-4.5 Testing doctrine (hard rules, see `CLAUDE.md`):
+4.5 Stage 4 - SHIPPED: compaction. Snapshots are mergeable CRDT states, one
+    chain per device. `compact()` folds history into a snapshot, deletes the
+    device's own op files once every live device has them and they are
+    older than the retention window (default 180 days), and a device that
+    was offline longer than that catches up by joining snapshots. A new
+    device downloads snapshots plus the recent tail, not the history.
+
+    **NOTE** Tombstones (deleted tags and list items) are kept forever for
+    now; garbage-collecting them safely is future work.
+
+4.6 Testing doctrine (hard rules, see `CLAUDE.md`):
     - Every engine change runs the fuzz suite: 1,000 seeds per change.
     - A failing seed means a real bug. Fix the engine. Never weaken the
       convergence check. Never delete a failing assertion.

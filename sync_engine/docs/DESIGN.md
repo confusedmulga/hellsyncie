@@ -100,7 +100,36 @@ Policy (owner decision, model does not change these numbers):
 - a device staler than the retained tail gets a full re-bootstrap from
   snapshot; its unsynced local ops are still valid (op-based, replayed
   on top)
-- tombstones live as long as the op tail
+- ~~tombstones live as long as the op tail~~ AMENDED 2026-09-24 (owner):
+  tombstones are kept forever in v1; see below.
+
+As built (Stage 4, owner-approved 2026-09-24):
+- A snapshot is the merged CRDT STATE (LWW registers with their stamps,
+  OR-set add/remove tags, RGA nodes with anchors and tombstones), not the
+  rendered document. States join: join(fold A, fold B) = fold(A ∪ B).
+  That one property does most of the work:
+  - "re-bootstrap" is just a join — a stale or new device joins the newest
+    snapshots it sees and pulls the tail; no special path;
+  - no canonical snapshot is needed. Each device writes its own chain,
+    `snap_<id>_<gen>.bin`; a newer gen contains everything an older one
+    did, and an older gen is deleted only after a newer one is confirmed;
+  - snapshots are fetched before op files, so the ops they cover are
+    never downloaded.
+- Pruning is limited to what no join can undo: LWW keeps winners, an
+  OR-set add-tag goes once a remove-tag cancels it, a deleted RGA element
+  loses its value. Remove-tags and RGA tombstone ids stay FOREVER (v1):
+  dropping them by age would let a device or old snapshot still carrying
+  the add resurrect the item. GC by causal stability is future work.
+- Remote deletion: a device deletes only its OWN op files, only below
+  min(cut of its snapshot confirmed on the backend by readback, retention
+  age, every live device's cursor). Correctness needs only the first term;
+  the other two are the retained-history policy above. A device whose
+  cursor is older than the retention window no longer blocks.
+- Cursors (`cursor_<id>.bin`) announce only what is DURABLE locally, so a
+  crash can never make a device hold less than it claimed.
+- File kinds, all versioned + CRC: op files (HSY1), snapshots (HSS1),
+  cursors (HSC1). Op files and snapshots are immutable per name; a cursor
+  is the one file a device overwrites.
 
 ## Format versioning
 Every file has a version byte. Reading a higher version than supported =
