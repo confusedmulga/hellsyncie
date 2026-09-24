@@ -2,8 +2,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'backend.dart';
-import 'crdt_engine.dart';
-import 'engine.dart';
+import 'crdt_state.dart';
 import 'format.dart';
 import 'hlc.dart';
 import 'local_store.dart';
@@ -66,7 +65,6 @@ class SyncClient {
     this.deviceId,
     this._backend,
     this._store,
-    this._engine,
     this._physicalMillis,
   ) : _clock = Hlc.zero(deviceId);
 
@@ -83,7 +81,6 @@ class SyncClient {
     required Backend backend,
     required LocalStore store,
     String? deviceId,
-    SyncEngine engine = const CrdtEngine(),
     int Function()? physicalMillis,
     Random? random,
   }) async {
@@ -101,7 +98,6 @@ class SyncClient {
       id,
       backend,
       store,
-      engine,
       physicalMillis ?? () => DateTime.now().millisecondsSinceEpoch,
     ).._load(await store.loadOps());
     return client;
@@ -112,13 +108,15 @@ class SyncClient {
 
   final Backend _backend;
   final LocalStore _store;
-  final SyncEngine _engine;
   final int Function() _physicalMillis;
 
   Hlc _clock;
   int _nextSeq = 0;
   final List<Op> _log = <Op>[];
   final Set<String> _keys = <String>{}; // op keys already in _log
+
+  /// Every op in [_log], folded. Updated as ops arrive, never re-folded.
+  final CrdtState _state = CrdtState();
 
   /// Own ops not yet confirmed intact on the backend, by file name. Transient:
   /// on open every own op is re-queued, so a backend that lost files is
@@ -148,7 +146,12 @@ class SyncClient {
 
   /// The merged state: a pure fold over every op held. Byte-identical on
   /// every device holding the same op set.
-  Uint8List materialize() => _engine.materialize(_log);
+  Uint8List materialize() => _state.serialize();
+
+  /// Ids of every element ever inserted into the list [listField] of [docId],
+  /// deleted ones included, ascending: valid anchors for [insertIntoList].
+  List<Hlc> listElementIds(String docId, String listField) =>
+      _state.elementIds(docId, listField);
 
   // --- authoring ---
 
@@ -174,7 +177,7 @@ class SyncClient {
     Uint8List element,
   ) =>
       _author(() {
-        final observed = CrdtEngine.addTagsFor(_log, docId, setField, element);
+        final observed = _state.addTagsFor(docId, setField, element);
         if (observed.isEmpty) return null;
         return SetRemove(
           docId: docId,
@@ -221,6 +224,7 @@ class SyncClient {
         _nextSeq = op.seq + 1; // a failed append consumes no sequence number
         _keys.add(op.key);
         _log.add(op);
+        _state.apply(operation);
         _unconfirmed[OpFileFormat.fileName(deviceId, op.seq)] = op;
       });
 
@@ -339,60 +343,36 @@ class SyncClient {
         }
         if (fresh.isEmpty) return 0;
         await _store.appendOps(fresh);
-        Hlc? high;
+        final before = _state.maxStamp;
         for (final op in fresh) {
           _keys.add(op.key);
           _log.add(op);
+          _state.applyOp(op);
           if (op.deviceId == deviceId) _nextSeq = max(_nextSeq, op.seq + 1);
-          high = _maxStamp(high, op);
         }
-        if (high != null) _clock = _clock.receive(high, _physicalMillis());
+        final high = _state.maxStamp;
+        if (high != null && high != before) {
+          _clock = _clock.receive(high, _physicalMillis());
+        }
         return fresh.length;
       });
 
   // --- open ---
 
   void _load(List<Op> stored) {
-    Hlc? high;
     for (final op in stored) {
       if (!_keys.add(op.key)) continue;
       _log.add(op);
+      _state.applyOp(op);
       if (op.deviceId == deviceId) {
         _nextSeq = max(_nextSeq, op.seq + 1);
         _unconfirmed[OpFileFormat.fileName(deviceId, op.seq)] = op;
       }
-      high = _maxStamp(high, op);
     }
     // Clock at the highest stamp held, so the next tick orders after every op
     // this device has authored or seen — the clock need not be stored.
+    final high = _state.maxStamp;
     if (high != null) _clock = Hlc(high.wallMillis, high.counter, deviceId);
-  }
-
-  static Hlc? _maxStamp(Hlc? high, Op op) {
-    for (final s in _stampsOf(op)) {
-      if (high == null || s.compareTo(high) > 0) high = s;
-    }
-    return high;
-  }
-
-  /// Every HLC an op carries, authored or referenced.
-  static List<Hlc> _stampsOf(Op op) {
-    final Operation o;
-    try {
-      o = OperationCodec.decode(op.payload);
-    } on FormatException {
-      return const <Hlc>[];
-    }
-    return switch (o) {
-      MapPut(:final hlc) => <Hlc>[hlc],
-      SetAdd(:final tag) => <Hlc>[tag],
-      SetRemove(:final observedTags) => observedTags,
-      ListInsert(:final id, :final after) => <Hlc>[
-          id,
-          if (after != null) after
-        ],
-      ListDelete(:final elementId) => <Hlc>[elementId],
-    };
   }
 
   static String _newDeviceId(Random rng) => <String>[

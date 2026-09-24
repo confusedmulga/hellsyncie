@@ -159,7 +159,7 @@ Future<FuzzResult> runFuzz(
             await client.removeFromSet(docId, 'tags', _element(rng));
           case 3:
             // RGA insert at head or after a random existing element.
-            final ids = CrdtEngine.elementIds(client.ops, docId, 'items');
+            final ids = client.listElementIds(docId, 'items');
             final after = ids.isEmpty || rng.nextBool()
                 ? null
                 : ids[rng.nextInt(ids.length)];
@@ -167,7 +167,7 @@ Future<FuzzResult> runFuzz(
                 after: after);
           default:
             // RGA delete of a random existing element, else insert instead.
-            final ids = CrdtEngine.elementIds(client.ops, docId, 'items');
+            final ids = client.listElementIds(docId, 'items');
             if (ids.isEmpty) {
               await client.insertIntoList(docId, 'items', _randomPayload(rng));
             } else {
@@ -214,6 +214,15 @@ Future<FuzzResult> runFuzz(
       return fail(
           'not quiescent after ${cfg.maxDrainRounds} drain rounds', rounds);
     }
+    // The incrementally maintained state must equal a fresh fold of the log.
+    for (final d in devices) {
+      if (!_bytesEqual(d.client.materialize(), _fold.materialize(d.log))) {
+        return fail(
+            'device ${d.id} incremental state differs from a fresh fold of '
+            'its own log',
+            rounds);
+      }
+    }
     final reference = devices.first.client.materialize();
     for (final d in devices.skip(1)) {
       final state = d.client.materialize();
@@ -246,6 +255,8 @@ Future<FuzzResult> runFuzz(
     return fail('threw: $e', 0);
   }
 }
+
+const CrdtEngine _fold = CrdtEngine();
 
 /// Fold the not-yet-scanned tail of [dev]'s log into its highest held stamp.
 void _scan(FuzzDevice dev) {

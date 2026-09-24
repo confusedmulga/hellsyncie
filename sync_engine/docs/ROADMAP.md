@@ -101,13 +101,39 @@ Still unverified until run on real Drive: 409 on a reused generated id in
 appDataFolder, and modifiedTime ordering of copies. Both are documented API
 behaviour; the fake assumes them.
 
-## 4. STAGE 4 — COMPACTION + SNAPSHOTS.  [PLAN MODE]
+## 4. STAGE 4 — COMPACTION + SNAPSHOTS.  [IN PROGRESS — plan approved 2026-09-24]
 
 COVERS: snapshot + retained op tail (180-day floor); per-device frontier cursor
 files; compaction only past the minimum known frontier; full re-bootstrap for a
 device staler than the tail; tombstone lifetime = the op tail.
 GATE: a device offline past the tail still converges from snapshot; the fuzzer
 gains compaction and clock-skew actions.
+
+DECIDED (owner, 2026-09-24):
+- Snapshots are MERGEABLE CRDT states (a join), one chain per writer
+  (`snap_<id>_<gen>.bin`). A stale device catches up by joining them; no
+  canonical snapshot, no special re-bootstrap path.
+- Tombstones (OR-set remove-tags, RGA tombstone ids) are KEPT FOREVER in v1.
+  Dropping them by age is unsafe under join. GC by causal stability is a
+  later slice. This amends "tombstone lifetime = the op tail".
+- Fuzz secondary invariant: op-log set equality → coverage-set equality
+  (snapshot cut ∪ tail keys). Merged-state equality unchanged.
+- Remote deletion as written: own op files only, and only when covered by a
+  confirmed own snapshot ∧ held by every live device ∧ older than 180 days;
+  a device silent > 180 days stops blocking.
+
+- 4a — incremental, joinable CrdtState.          [DONE 2026-09-24]
+- 4b — snapshots + local compaction.             [NEXT]
+- 4c — cursors, remote deletion, sleeper devices.
+- 4d — compaction over fs + Drive fuzz; docs.
+
+NOTE (4a): `CrdtState` folds ops incrementally and joins with other states;
+its rendered output is byte-identical to the pre-4a fold, checked against a
+frozen copy of that fold (`test/support/reference_fold.dart`) on 10,000
+random histories. Join is proven commutative, associative, idempotent, and
+equal to the fold of the union, including after pruning and a codec round
+trip. SyncClient no longer re-folds the log per call or rescans it per edit.
+The fuzzer also asserts incremental state == a fresh fold of each log.
 
 ## 5. STAGE 5 — FLUTTER BINDING.
 

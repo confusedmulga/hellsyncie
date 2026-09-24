@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `CrdtState`: the merged state, updated one op at a time, joinable with
+  another state (state-based CRDT), prunable, and encodable (the future
+  snapshot payload). `CrdtEngine` is now a fold into it; rendered output is
+  byte-identical to before.
+- `SyncClient` keeps a `CrdtState` instead of re-folding the log;
+  `listElementIds` added; the `engine:` parameter of `open` is removed.
+- `CrdtEngine.addTagsFor` / `SyncClient.removeFromSet` observe only live
+  (uncancelled) add-tags; equivalent results, smaller remove ops.
 - `SyncClient`: the device-side sync loop as a public API. It persists each op
   before publishing it, confirms uploads by readback, re-adopts own ops a store
   lost, detects a device id shared by two stores, and coalesces concurrent

@@ -1,199 +1,45 @@
-import 'dart:convert';
 import 'dart:typed_data';
 
-import 'crdt/lww_register.dart';
-import 'crdt/or_set.dart';
-import 'crdt/rga.dart';
+import 'crdt_state.dart';
 import 'engine.dart';
 import 'hlc.dart';
 import 'op.dart';
-import 'operation.dart';
-import 'operation_codec.dart';
 
-/// The CRDT merge engine.
+/// The CRDT merge engine: folds an op set into a [CrdtState] and renders it.
 ///
-/// Slice 2a: LWW-register maps. Slice 2b: OR-sets (add-wins).
-///
-/// [materialize] is a pure, order-independent fold over the op set. Applying
-/// the same ops in any order, with duplicates, yields byte-identical output.
+/// [materialize] is a pure, order-independent fold. Applying the same ops in
+/// any order, with duplicates, yields byte-identical output. Long-lived
+/// callers (the sync client) keep a [CrdtState] and update it incrementally
+/// instead of re-folding.
 class CrdtEngine implements SyncEngine {
   const CrdtEngine();
 
-  @override
-  Uint8List materialize(Iterable<Op> ops) {
-    final lww = <String, Map<String, LwwRegister>>{}; // doc -> field -> reg
-    final sets = <String, Map<String, OrSet>>{}; // doc -> setField -> OrSet
-    final lists = <String, Map<String, Rga>>{}; // doc -> listField -> Rga
-
-    for (final op in ops) {
-      final Operation decoded;
-      try {
-        decoded = OperationCodec.decode(op.payload);
-      } on FormatException {
-        continue; // undecodable payload: skip, same as a corrupt op file
-      }
-      switch (decoded) {
-        case final MapPut o:
-          final fields =
-              lww.putIfAbsent(o.docId, () => <String, LwwRegister>{});
-          final incoming = LwwRegister(o.value, o.hlc);
-          final cur = fields[o.field];
-          fields[o.field] = cur == null ? incoming : cur.merge(incoming);
-        case final SetAdd o:
-          _setFor(sets, o.docId, o.setField).add(o.element, o.tag);
-        case final SetRemove o:
-          _setFor(sets, o.docId, o.setField).remove(o.element, o.observedTags);
-        case final ListInsert o:
-          _listFor(lists, o.docId, o.listField).insert(o.id, o.after, o.value);
-        case final ListDelete o:
-          _listFor(lists, o.docId, o.listField).delete(o.elementId);
-      }
-    }
-    return _serialize(lww, sets, lists);
+  /// Fold [ops] into a fresh state.
+  static CrdtState fold(Iterable<Op> ops) {
+    final state = CrdtState();
+    ops.forEach(state.applyOp);
+    return state;
   }
 
-  static OrSet _setFor(
-    Map<String, Map<String, OrSet>> sets,
-    String docId,
-    String setField,
-  ) =>
-      sets.putIfAbsent(docId, () => <String, OrSet>{}).putIfAbsent(
-            setField,
-            OrSet.new,
-          );
+  @override
+  Uint8List materialize(Iterable<Op> ops) => fold(ops).serialize();
 
-  static Rga _listFor(
-    Map<String, Map<String, Rga>> lists,
-    String docId,
-    String listField,
-  ) =>
-      lists.putIfAbsent(docId, () => <String, Rga>{}).putIfAbsent(
-            listField,
-            Rga.new,
-          );
-
-  /// Every RGA element id for one list across [ops], in log order — what a
-  /// device folds to choose an insert anchor or a delete target. Pure/static.
+  /// Every RGA element id ever inserted into one list across [ops], deleted
+  /// ones included, ascending — candidates for an insert anchor or a delete.
   static List<Hlc> elementIds(
     Iterable<Op> ops,
     String docId,
     String listField,
-  ) {
-    final ids = <Hlc>[];
-    for (final op in ops) {
-      final Operation decoded;
-      try {
-        decoded = OperationCodec.decode(op.payload);
-      } on FormatException {
-        continue;
-      }
-      if (decoded is ListInsert &&
-          decoded.docId == docId &&
-          decoded.listField == listField) {
-        ids.add(decoded.id);
-      }
-    }
-    return ids;
-  }
+  ) =>
+      fold(ops).elementIds(docId, listField);
 
-  /// All add-tags for one element across [ops] — what a device folds to author
-  /// a [SetRemove] that "observes" the element's current tags. Pure/static.
+  /// The live (uncancelled) add-tags of one OR-set element across [ops] —
+  /// what a `SetRemove` must observe to make the element absent.
   static List<Hlc> addTagsFor(
     Iterable<Op> ops,
     String docId,
     String setField,
     Uint8List element,
-  ) {
-    final key = OrSet.keyOf(element);
-    final tags = <Hlc>[];
-    for (final op in ops) {
-      final Operation decoded;
-      try {
-        decoded = OperationCodec.decode(op.payload);
-      } on FormatException {
-        continue;
-      }
-      if (decoded is SetAdd &&
-          decoded.docId == docId &&
-          decoded.setField == setField &&
-          OrSet.keyOf(decoded.element) == key) {
-        tags.add(decoded.tag);
-      }
-    }
-    return tags;
-  }
-
-  /// Canonical, length-prefixed serialization. Length prefixes keep it
-  /// unambiguous for any bytes; sorting makes it order-independent.
-  Uint8List _serialize(
-    Map<String, Map<String, LwwRegister>> lww,
-    Map<String, Map<String, OrSet>> sets,
-    Map<String, Map<String, Rga>> lists,
-  ) {
-    final bb = BytesBuilder();
-    final docIds = <String>{...lww.keys, ...sets.keys, ...lists.keys}.toList()
-      ..sort();
-    _u32(bb, docIds.length);
-    for (final docId in docIds) {
-      _str(bb, docId);
-
-      // LWW fields (sorted by name).
-      final fields = lww[docId] ?? const <String, LwwRegister>{};
-      final fieldNames = fields.keys.toList()..sort();
-      _u32(bb, fieldNames.length);
-      for (final name in fieldNames) {
-        _str(bb, name);
-        _bytes(bb, fields[name]!.value);
-      }
-
-      // OR-sets (sorted by name; present elements sorted by bytes).
-      final docSets = sets[docId] ?? const <String, OrSet>{};
-      final setNames = docSets.keys.toList()..sort();
-      _u32(bb, setNames.length);
-      for (final name in setNames) {
-        _str(bb, name);
-        final elems = docSets[name]!.present().toList()..sort(_cmpBytes);
-        _u32(bb, elems.length);
-        for (final e in elems) {
-          _bytes(bb, e);
-        }
-      }
-
-      // RGA lists (sorted by name; values kept in LIST ORDER, not sorted).
-      final docLists = lists[docId] ?? const <String, Rga>{};
-      final listNames = docLists.keys.toList()..sort();
-      _u32(bb, listNames.length);
-      for (final name in listNames) {
-        _str(bb, name);
-        final values = docLists[name]!.toList();
-        _u32(bb, values.length);
-        for (final v in values) {
-          _bytes(bb, v);
-        }
-      }
-    }
-    return bb.toBytes();
-  }
-
-  static void _u32(BytesBuilder bb, int v) => bb.add(<int>[
-        (v >> 24) & 0xff,
-        (v >> 16) & 0xff,
-        (v >> 8) & 0xff,
-        v & 0xff,
-      ]);
-
-  static void _bytes(BytesBuilder bb, List<int> x) {
-    _u32(bb, x.length);
-    bb.add(x);
-  }
-
-  static void _str(BytesBuilder bb, String s) => _bytes(bb, utf8.encode(s));
-
-  static int _cmpBytes(Uint8List a, Uint8List b) {
-    final n = a.length < b.length ? a.length : b.length;
-    for (var i = 0; i < n; i++) {
-      if (a[i] != b[i]) return a[i] - b[i];
-    }
-    return a.length - b.length;
-  }
+  ) =>
+      fold(ops).addTagsFor(docId, setField, element);
 }

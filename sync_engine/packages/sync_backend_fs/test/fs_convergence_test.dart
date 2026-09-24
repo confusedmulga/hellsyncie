@@ -18,13 +18,13 @@ Future<void> _randomOp(SyncClient c, Random rng) async {
     case 2:
       await c.removeFromSet(doc, 'tags', _b('t${rng.nextInt(4)}'));
     case 3:
-      final ids = CrdtEngine.elementIds(c.ops, doc, 'items');
+      final ids = c.listElementIds(doc, 'items');
       final after =
           ids.isEmpty || rng.nextBool() ? null : ids[rng.nextInt(ids.length)];
       await c.insertIntoList(doc, 'items', _b('i${rng.nextInt(100)}'),
           after: after);
     default:
-      final ids = CrdtEngine.elementIds(c.ops, doc, 'items');
+      final ids = c.listElementIds(doc, 'items');
       if (ids.isEmpty) return;
       await c.removeFromList(doc, 'items', ids[rng.nextInt(ids.length)]);
   }
