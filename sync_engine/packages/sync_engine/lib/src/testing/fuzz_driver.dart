@@ -57,6 +57,7 @@ class FuzzConfig {
     FaultConfig Function()? faults,
     this.faultsDuringDrain = false,
     this.maxDrainRounds = 64,
+    this.onDrain,
   }) : faults = faults ?? defaultFaults;
 
   /// Number of chaos steps before the final drain.
@@ -72,6 +73,12 @@ class FuzzConfig {
 
   /// Cap on drain rounds before declaring "not quiescent".
   final int maxDrainRounds;
+
+  /// Called as the drain starts (unless [faultsDuringDrain]). Turn off faults
+  /// injected BELOW the backend here — a fake server's 5xx, say. The drain
+  /// must be honest: while a transient fault can still eat a download, a
+  /// round that moves nothing does not mean everything has arrived.
+  final void Function()? onDrain;
 
   static FaultConfig defaultFaults() => FaultConfig(
         truncatedUpload: 0.10,
@@ -182,6 +189,7 @@ Future<FuzzResult> runFuzz(
     // --- drain phase: sync rounds until quiescent ---
     if (!cfg.faultsDuringDrain) {
       faulty.faults = FaultConfig.none();
+      cfg.onDrain?.call();
     }
     var quiescent = false;
     var rounds = 0;

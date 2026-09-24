@@ -49,7 +49,8 @@ GATE: a real backend drops into the harness / integration tests unchanged.
 
 - 3a — sync_backend_fs (folder, atomic writes).   [DONE 2026-09-24]
 - 3s — public SyncClient + fuzz any Backend.      [DONE 2026-09-24]
-- 3b — sync_backend_drive (Drive appDataFolder).  [NEXT — needs dep approval]
+- 3b — sync_backend_drive (Drive appDataFolder).  [BUILT 2026-09-24 — fake
+        HTTP only; real-Drive run pending a Cloud project + OAuth client]
 
 NOTE (3a gate): met by a backend contract suite plus a multi-replica
 convergence test — replicas share one real folder, author all five operation
@@ -79,9 +80,26 @@ OPEN (found in 3s, not yet fixed):
   is needed before Stage 5 — it touches the engine, so plan mode.
 - Newer operation versions are skipped silently at materialize; DESIGN says
   refuse and surface "update the app".
-- 3b: Drive allows two files with one name. The Drive backend must upsert by
-  name (update the existing file id); otherwise every re-push adds a copy and
-  `download(name)` has no single answer.
+
+NOTE (3b): deps `googleapis` + `http` approved 2026-09-24 (`googleapis_auth`
+approved but unused: the app hands in an authenticated client). Tested against
+`FakeDrive`, an in-memory server behind `MockClient` that speaks the REST
+shapes googleapis really sends and injects Drive's own faults — 5xx before a
+write, response lost after a write, search lagging behind writes — under the
+contract-level `FaultyBackend`. 200 seeds per change; 400 run clean.
+Design points the fuzz forced:
+- Drive names are not unique. A create whose response is lost, retried while
+  search lags, duplicated the file; with the truncated-upload fault on top the
+  copies could differ, and a stale copy surfacing after confirmation would
+  strand the op on other devices. Fix: create under an id reserved with
+  `files.generateIds`, remembered per name, so a retry gets 409 and becomes an
+  update. Cross-process duplicates (restart mid-retry) are folded by the next
+  upload, and download reads the newest copy.
+- The drain must be honest at every layer: `FuzzConfig.onDrain` turns off
+  faults injected below the backend. Pinned Drive seed 4 shows why.
+Still unverified until run on real Drive: 409 on a reused generated id in
+appDataFolder, and modifiedTime ordering of copies. Both are documented API
+behaviour; the fake assumes them.
 
 ## 4. STAGE 4 — COMPACTION + SNAPSHOTS.  [PLAN MODE]
 
@@ -114,5 +132,6 @@ limitation, not a bug).
 
 CURRENT POSITION: Stage 2 complete. Stage 3 in progress — 3a (folder backend)
 and 3s (public SyncClient; fault fuzzer runs over real backends) done and
-green. Next: 3b (Drive backend, blocked on dependency approval), or Stage 4
+green; 3b (Drive backend) built and fuzz-green against a fake Drive. Next:
+verify 3b on real Drive (needs a Cloud project + OAuth client), or Stage 4
 (compaction, plan-mode).

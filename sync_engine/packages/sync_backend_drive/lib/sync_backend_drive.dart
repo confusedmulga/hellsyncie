@@ -1,6 +1,6 @@
-/// STUB. A [Backend] over Google Drive's appDataFolder.
-///
-/// Later builds implement list/download/upload/delete against the hidden,
-/// per-app Drive folder the user already owns. Expect stale listings and
-/// delayed visibility — the contract already assumes them.
+/// A [Backend] over Google Drive's hidden, per-app `appDataFolder`.
 library;
+
+import 'package:sync_engine/sync_engine.dart';
+
+export 'src/drive_backend.dart';

@@ -101,7 +101,9 @@ Read this before writing code against it. Sections are numbered. Notes marked
     - `SyncClient` - the device-side sync loop as a public, pure-Dart API.
       The fault fuzzer drives it over any backend, the real folder included.
       SHIPPED.
-    - `sync_backend_drive` - Google Drive appDataFolder. Next.
+    - `sync_backend_drive` - Google Drive appDataFolder. BUILT against a fake
+      Drive server (real REST shapes, Drive's own failure modes, 200-seed
+      fault fuzz); not yet run against real Drive.
 
     **NOTE** Live build status is kept in `sync_engine/docs/ROADMAP.md`.
 
@@ -210,8 +212,9 @@ dart pub global activate melos
 ## 8. FLUTTER (ANDROID) INTEGRATION
 
 **NOTE** The merge engine (Stage 2), the folder backend (Stage 3a), and the
-pure-Dart `SyncClient` have shipped. The Drive backend (Stage 3b) and the
-Flutter binding (Stage 5) have not, per §4. The steps below are the TARGET integration - the intended, stable
+pure-Dart `SyncClient` have shipped. The Drive backend (Stage 3b) is built
+but not yet verified against real Drive; the Flutter binding (Stage 5) has not
+started, per §4. The steps below are the TARGET integration - the intended, stable
 shape of the API - so an app team can plan against it now. Names may tighten
 before 1.0.
 
@@ -244,12 +247,12 @@ import 'package:sync_engine/sync_engine.dart';
 import 'package:sync_engine_flutter/sync_engine_flutter.dart';
 import 'package:sync_backend_drive/sync_backend_drive.dart';
 
-// One stable id per install, generated once and persisted on-device.
-final backend = DriveBackend(appDataFolder: true);
-final store = await SyncStore.open(
-  backend: backend,
-  deviceId: await SyncStore.loadOrCreateDeviceId(),
-);
+// Sign in with scope DriveBackend.scope (drive.appdata only) and hand over
+// the authenticated http.Client - e.g. google_sign_in's authenticatedClient().
+// The backend never touches credentials. (DriveBackend is real today.)
+final backend = DriveBackend(authenticatedClient);
+// The device id is generated once per install and kept in the local store.
+final store = await SyncStore.open(backend: backend);
 ```
 
 8.4 Declare data as CRDT types. Target API:
@@ -338,7 +341,7 @@ hellsyncie/
                                 SyncClient; testing.dart = fuzzer
       sync_engine_flutter/      Flutter binding                        [stub]
       sync_backend_fs/          folder backend + on-disk local store   [SHIPPED]
-      sync_backend_drive/       Google Drive backend                   [stub]
+      sync_backend_drive/       Google Drive backend        [built; fake-tested]
 ```
 
 **NOTE** `CLAUDE.md` and `docs/DESIGN.md` currently sit under `sync_engine/`.
