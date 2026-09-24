@@ -54,6 +54,28 @@ class _CountingBackend extends MemoryBackend {
   }
 }
 
+/// Reports success for one named upload while persisting nothing.
+class _DroppingBackend implements Backend {
+  _DroppingBackend(this.inner, this.drop);
+
+  final Backend inner;
+  final String drop;
+
+  @override
+  Future<List<RemoteFile>> list() => inner.list();
+
+  @override
+  Future<Uint8List> download(String name) => inner.download(name);
+
+  @override
+  Future<void> upload(String name, Uint8List bytes) async {
+    if (name != drop) await inner.upload(name, bytes);
+  }
+
+  @override
+  Future<void> delete(String name) => inner.delete(name);
+}
+
 void main() {
   test('two clients converge through one backend', () async {
     final backend = MemoryBackend();
@@ -130,7 +152,11 @@ void main() {
     await c.put('d', 'f', _b('kept'));
     await c.sync();
     expect(c.ops.single.key, 'a#0');
-    expect((await backend.list()).map((f) => f.name), <String>['ops_a_0.bin']);
+    expect(
+        (await backend.list())
+            .map((f) => f.name)
+            .where((n) => n.startsWith('ops_')),
+        <String>['ops_a_0.bin']);
   });
 
   test('a truncated upload is re-pushed until it reads back intact', () async {
@@ -141,7 +167,7 @@ void main() {
     await c.put('d', 'f', _b('value'));
 
     final first = await c.sync();
-    expect(first.pending, 1);
+    expect(first.pending, 2, reason: 'the op and the cursor, both truncated');
     await expectLater(
         inner.download('ops_a_0.bin').then(OpCodec.decode), // a prefix only
         throwsFormatException);
@@ -328,7 +354,9 @@ void main() {
       final c = await _open(backend, id: 'c');
       final result = await c.sync();
       expect(result.received, 2, reason: 'one snapshot + one tail op');
-      expect(backend.downloads, <String>['snap_a_1.bin', 'ops_a_4.bin']);
+      expect(backend.downloads,
+          <String>['snap_a_1.bin', 'ops_a_4.bin', 'cursor_c.bin'],
+          reason: 'snapshot + tail, then the readback of its own cursor');
       expect(c.materialize(), a.materialize());
       expect(c.frontier, <String, int>{'a': 5});
     });
@@ -358,11 +386,13 @@ void main() {
       a = await _open(backend, id: 'a', store: store);
       await a.put('d', 'f', _b('2'));
       await a.compact();
+      expect(a.confirmedSnapshotGen, 3);
       expect(
           (await backend.list())
               .map((f) => f.name)
               .where((n) => n.startsWith('snap_')),
-          <String>['snap_a_1.bin', 'snap_a_2.bin', 'snap_a_3.bin']);
+          <String>['snap_a_3.bin'],
+          reason: 'superseded gens are deleted once gen 3 is confirmed');
     });
 
     test('a store whose snapshot names another device refuses to open',
@@ -374,6 +404,140 @@ void main() {
               .encode());
       await expectLater(
           _open(MemoryBackend(), id: 'a', store: store), throwsStateError);
+    });
+  });
+
+  group('remote deletion', () {
+    const retention = Duration(milliseconds: 100);
+    late MemoryBackend backend;
+    late int now;
+
+    setUp(() {
+      backend = MemoryBackend();
+      now = 0;
+    });
+
+    Future<SyncClient> device(String id, {Backend? via, LocalStore? store}) =>
+        SyncClient.open(
+          backend: via ?? backend,
+          store: store ?? MemoryStore(),
+          deviceId: id,
+          physicalMillis: () => now,
+          retention: retention,
+        );
+
+    Future<List<String>> files(String prefix) async => (await backend.list())
+        .map((f) => f.name)
+        .where((n) => n.startsWith(prefix))
+        .toList();
+
+    Future<void> plantCursor(String writer, int time, Map<String, int> f) =>
+        backend.upload(CursorFormat.fileName(writer),
+            Cursor(writer: writer, timeMillis: time, frontier: f).encode());
+
+    test(
+        'an offline device past the tail converges from the snapshot '
+        '(the Stage 4 gate)', () async {
+      final a = await device('a');
+      final sleeper = await device('s');
+      await sleeper.put('d', 'early', _b('before-sleep'));
+      await sleeper.sync(); // leaves a cursor, then goes offline
+      for (var i = 0; i < 5; i++) {
+        await a.put('d', 'f$i', _b('a$i'));
+      }
+      await a.sync();
+      await sleeper.put('d', 'offline', _b('written-offline'));
+
+      now = 50; // younger than the retention window: nothing deleted
+      await a.compact();
+      expect(await files('ops_a_'), hasLength(5));
+
+      now = 500; // the sleeper's cursor is now older than retention
+      await a.compact();
+      expect(await files('ops_a_'), isEmpty,
+          reason: 'history past the tail deleted');
+
+      await sleeper.sync();
+      await a.sync();
+      expect(sleeper.materialize(), a.materialize());
+      expect(_text(a.materialize()),
+          allOf(contains('a4'), contains('written-offline')));
+    });
+
+    test('a live device whose cursor lags holds deletion back', () async {
+      final a = await device('a');
+      for (var i = 0; i < 4; i++) {
+        await a.put('d', 'f$i', _b('v$i'));
+      }
+      await a.sync();
+      now = 1000;
+      await plantCursor('lag', 1000, <String, int>{}); // live, holds nothing
+      await a.compact();
+      expect(await files('ops_a_'), hasLength(4));
+
+      await plantCursor('lag', 1000, <String, int>{'a': 3});
+      await a.compact();
+      expect(await files('ops_a_'), <String>['ops_a_3.bin']);
+
+      await backend.upload(CursorFormat.fileName('lag'), _b('garbage'));
+      await a.put('d', 'g', _b('w'));
+      await a.sync();
+      now = 2000;
+      await a.compact();
+      expect(await files('ops_a_'), hasLength(2),
+          reason: 'an unreadable cursor counts as holding nothing');
+    });
+
+    test('ops younger than the retention window stay', () async {
+      final a = await device('a');
+      await a.put('d', 'old', _b('1'));
+      await a.sync();
+      now = 150;
+      await a.put('d', 'new', _b('2'));
+      await a.removeFromSet('d', 'tags', _b('none')); // authors nothing
+      await a.addToSet('d', 'tags', _b('t'));
+      await a.removeFromSet('d', 'tags', _b('t')); // mints no stamp
+      now = 200; // cutoff 100: only the op stamped at 0 is old enough
+      await a.compact();
+      expect(await files('ops_a_'),
+          <String>['ops_a_1.bin', 'ops_a_2.bin', 'ops_a_3.bin']);
+    });
+
+    test('never deletes ops beyond its confirmed snapshot', () async {
+      // A backend that silently drops one specific upload.
+      final dropper = _DroppingBackend(backend, 'snap_a_2.bin');
+      final a = await device('a', via: dropper);
+      final b = await device('b');
+      await a.put('d', 'f0', _b('v0'));
+      await a.put('d', 'f1', _b('v1'));
+      await a.compact(); // snap_a_1 confirmed, cut a:2
+      for (var i = 2; i < 5; i++) {
+        await a.put('d', 'f$i', _b('v$i'));
+      }
+      await a.sync();
+      await b.sync(); // b's cursor covers all five of a's ops
+
+      now = 1000;
+      await a.compact(); // snap_a_2 never lands; only snap_a_1 is confirmed
+      expect(await files('ops_a_'),
+          <String>['ops_a_2.bin', 'ops_a_3.bin', 'ops_a_4.bin'],
+          reason: 'only ops snap_a_1 covers may go');
+
+      final c = await device('c'); // a newcomer bootstraps from the backend
+      await c.sync();
+      expect(c.materialize(), a.materialize());
+    });
+
+    test('superseded own snapshots are deleted once a newer one is confirmed',
+        () async {
+      final a = await device('a');
+      await a.put('d', 'f', _b('1'));
+      await a.compact();
+      await a.put('d', 'f', _b('2'));
+      await a.compact();
+      await a.put('d', 'f', _b('3'));
+      await a.compact();
+      expect(await files('snap_a_'), <String>['snap_a_3.bin']);
     });
   });
 

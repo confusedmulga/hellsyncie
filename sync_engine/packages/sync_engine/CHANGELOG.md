@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Remote deletion: `Cursor` / `CursorFormat` (`cursor_<id>.bin`), written
+  each round the durable frontier moves; `compact()` deletes own op files
+  (covered by the confirmed own snapshot, held by every live device, older
+  than `retention`) and superseded own snapshots. `SyncClient.open` takes
+  `retention` (default 180 days).
+- `FaultConfig.droppedDelete`; fuzzer sleeper devices and deletion counts.
 - Snapshots: `Snapshot` / `SnapshotFormat` (`snap_<id>_<gen>.bin`),
   `SyncClient.compact()`, snapshot joins on pull (before any op download),
   `frontier`, `confirmedSnapshotGen`. `SyncClient.ops` is now the log tail.

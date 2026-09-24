@@ -55,6 +55,29 @@ class SnapshotFormat {
   }
 }
 
+/// Cursor files: `cursor_<deviceId>.bin`, the one file a device overwrites. It
+/// announces the device's frontier — how many of each author's ops it holds
+/// durably — and when it last wrote it. Readers only ever under-count from a
+/// stale or missing cursor, which errs on the side of keeping files.
+class CursorFormat {
+  CursorFormat._();
+
+  /// Magic bytes 'HSC1' identifying a hellsyncie cursor file.
+  static const List<int> magic = <int>[0x48, 0x53, 0x43, 0x31];
+
+  /// Current cursor format version.
+  static const int version = 1;
+
+  static String fileName(String deviceId) => 'cursor_$deviceId.bin';
+
+  /// Inverse of [fileName], or null.
+  static String? parseFileName(String name) {
+    if (!name.startsWith('cursor_') || !name.endsWith('.bin')) return null;
+    final id = name.substring(7, name.length - 4);
+    return OpFileFormat.isValidDeviceId(id) ? id : null;
+  }
+}
+
 /// Parse `<prefix><deviceId>_<n>.bin`, accepting only the canonical spelling
 /// that [make] produces.
 ({String id, int n})? _parse(

@@ -13,6 +13,7 @@ class FaultConfig {
     this.delayedVisibility = 0,
     this.droppedUpload = 0,
     this.duplicateDelivery = 0,
+    this.droppedDelete = 0,
     this.staleDepth = 3,
     this.visibilityDelay = 2,
   });
@@ -32,6 +33,9 @@ class FaultConfig {
   /// List the same file twice.
   double duplicateDelivery;
 
+  /// Report a delete as done while the file stays.
+  double droppedDelete;
+
   /// N: how far back a stale listing is drawn from.
   int staleDepth;
 
@@ -42,7 +46,8 @@ class FaultConfig {
   static FaultConfig none() => FaultConfig();
 }
 
-/// Wraps any [Backend] and makes it exhibit the five lies the contract allows.
+/// Wraps any [Backend] and makes it exhibit the lies the contract allows: the
+/// five upload/listing faults, plus deletes that silently do nothing.
 /// Deterministic: every fault decision is drawn from the injected [Random], so
 /// a seed replays the same fault schedule over any inner backend.
 ///
@@ -123,6 +128,7 @@ class FaultyBackend implements Backend {
   @override
   Future<void> delete(String name) async {
     _tick();
+    if (_dice(faults.droppedDelete)) return; // report success, keep the file
     await inner.delete(name);
     _hiddenFor.remove(name);
   }

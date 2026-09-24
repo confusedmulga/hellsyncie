@@ -124,8 +124,8 @@ DECIDED (owner, 2026-09-24):
 
 - 4a — incremental, joinable CrdtState.          [DONE 2026-09-24]
 - 4b — snapshots + local compaction.             [DONE 2026-09-24]
-- 4c — cursors, remote deletion, sleeper devices. [NEXT]
-- 4d — compaction over fs + Drive fuzz; docs.
+- 4c — cursors, remote deletion, sleeper devices. [DONE 2026-09-24]
+- 4d — docs; DESIGN amendment.                   [NEXT]
 
 NOTE (4a): `CrdtState` folds ops incrementally and joins with other states;
 its rendered output is byte-identical to the pre-4a fold, checked against a
@@ -148,6 +148,24 @@ every store must reopen to the state its device holds. Logs shrank in 299 of
 snapshot, local compaction shedding own ops. Limitation until 4c: no op file
 is ever deleted from the backend, so a device that loses track of snapshot
 coverage can heal by re-downloading — some snapshot bugs only show in 4c.
+
+NOTE (4c): `cursor_<id>.bin` (HSC1) announces a device's DURABLE frontier and
+its clock; it is queued before the push so the same round confirms it.
+`compact()` then deletes own op files below min(confirmed own snapshot cut,
+retention age limit, every live device's cursor), and superseded own
+snapshots. A device whose cursor is older than the retention window stops
+blocking; an unreadable cursor counts as holding nothing. New fault:
+droppedDelete. Fuzz: 30 ms retention, a sleeper device in a third of runs
+(syncs early, then offline while others compact and delete), counts of
+deleted op files; 3,000 seeds green, deletion in ~65% of runs including past
+sleepers. The Stage 4 GATE ("a device offline past the tail still converges
+from snapshot") is met by fuzz and by a deterministic test.
+As predicted by the snapshot design, skipping the frontier gate does NOT
+break convergence (it only changes retained history) — the gate is policy,
+tested by unit tests. Mutants caught: trusting a snapshot upload without
+readback; deleting the newest confirmed snapshot; deleting beyond the
+confirmed cut (unit test — the fuzz masks it when other devices' snapshots
+cover the same ops); ignoring cursors; no dead-device rule.
 
 ## 5. STAGE 5 — FLUTTER BINDING.
 

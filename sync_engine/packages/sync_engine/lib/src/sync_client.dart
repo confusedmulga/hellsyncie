@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'backend.dart';
 import 'crdt_state.dart';
+import 'cursor.dart';
 import 'format.dart';
 import 'hlc.dart';
 import 'local_store.dart';
@@ -67,6 +68,7 @@ class SyncClient {
     this._backend,
     this._store,
     this._physicalMillis,
+    this._retentionMs,
   ) : _clock = Hlc.zero(deviceId);
 
   /// Open a client over [store], loading its durable op log.
@@ -78,12 +80,17 @@ class SyncClient {
   ///
   /// [physicalMillis] is the wall-clock source (millis since epoch); inject a
   /// deterministic one in tests. [random] seeds device-id generation.
+  ///
+  /// [retention] is the op history [compact] keeps on the backend: an own op
+  /// file younger than it is never deleted, and a device whose cursor is
+  /// older than it stops holding deletion back.
   static Future<SyncClient> open({
     required Backend backend,
     required LocalStore store,
     String? deviceId,
     int Function()? physicalMillis,
     Random? random,
+    Duration retention = const Duration(days: 180),
   }) async {
     final saved = await store.loadDeviceId();
     final id = deviceId ?? saved ?? _newDeviceId(random ?? Random.secure());
@@ -100,6 +107,7 @@ class SyncClient {
       backend,
       store,
       physicalMillis ?? () => DateTime.now().millisecondsSinceEpoch,
+      retention.inMilliseconds,
     );
     client._load(await store.loadSnapshot(), await store.loadOps());
     return client;
@@ -111,6 +119,7 @@ class SyncClient {
   final Backend _backend;
   final LocalStore _store;
   final int Function() _physicalMillis;
+  final int _retentionMs;
 
   Hlc _clock;
   int _nextSeq = 0;
@@ -133,11 +142,27 @@ class SyncClient {
   /// gen is uploaded, so a gen number never names two different snapshots.
   int _gen = 0;
 
-  /// Own snapshot uploaded but not yet confirmed by readback.
-  ({String name, Uint8List bytes, int gen})? _pendingSnapshot;
+  /// The cut of the snapshot last saved to the store: what is held DURABLY.
+  /// Cursors announce only this (plus the durable log), never more.
+  Map<String, int> _savedCut = const <String, int>{};
 
-  /// Highest own snapshot gen confirmed intact on the backend since open.
+  /// Own files other than op files (snapshot, cursor) uploaded but not yet
+  /// confirmed by an identical readback, with what to do once they are.
+  final Map<String, ({Uint8List bytes, void Function()? onConfirmed})>
+      _pendingFiles =
+      <String, ({Uint8List bytes, void Function()? onConfirmed})>{};
+
+  /// Highest own snapshot gen confirmed intact on the backend since open, and
+  /// its cut. Remote deletion is bounded by this cut.
   int _confirmedGen = 0;
+  Map<String, int>? _confirmedCut;
+
+  /// The frontier and time of the last cursor written since open.
+  Map<String, int>? _cursorFrontier;
+  int _cursorTime = 0;
+
+  /// File names seen by the last pull.
+  Set<String> _lastNames = const <String>{};
 
   bool _compactRequested = false;
 
@@ -164,13 +189,15 @@ class SyncClient {
 
   /// Per author, how many of its ops this device holds contiguously from seq
   /// 0 — in a snapshot or in [ops]. Authors with none are omitted.
-  Map<String, int> get frontier {
+  Map<String, int> get frontier => _frontierOver(_base);
+
+  Map<String, int> _frontierOver(Map<String, int> base) {
     final out = <String, int>{};
     for (final a in <String>{
-      ..._base.keys,
+      ...base.keys,
       for (final op in _log) op.deviceId
     }) {
-      var k = _base[a] ?? 0;
+      var k = base[a] ?? 0;
       while (_keys.contains('$a#$k')) {
         k++;
       }
@@ -186,8 +213,7 @@ class SyncClient {
   Hlc get clock => _clock;
 
   /// Own ops (and snapshot) not yet confirmed on the backend.
-  int get pendingUploads =>
-      _unconfirmed.length + (_pendingSnapshot == null ? 0 : 1);
+  int get pendingUploads => _unconfirmed.length + _pendingFiles.length;
 
   /// The merged state of everything held. Byte-identical on every device
   /// holding the same op set, whether as ops or folded into snapshots.
@@ -305,10 +331,18 @@ class SyncClient {
     );
   }
 
-  /// A sync round that also compacts: saves the whole state as the local
-  /// snapshot, drops the pulled ops it covers from the local store, and
-  /// publishes it as `snap_<deviceId>_<gen>` — confirmed, like ops, only by
-  /// reading it back intact.
+  /// A sync round that also compacts:
+  ///
+  ///  1. saves the whole state as the local snapshot, drops the pulled ops it
+  ///     covers from the local store, and publishes it as
+  ///     `snap_<deviceId>_<gen>` — confirmed only by reading it back intact;
+  ///  2. deletes this device's own op files that are covered by its confirmed
+  ///     snapshot, held by every live device (per their cursors), and older
+  ///     than the retention window; then its superseded snapshots.
+  ///
+  /// Only own files are ever deleted. Correctness needs only step 1's
+  /// confirmation: any device missing a deleted op gets it from the snapshot.
+  /// The frontier and age rules decide how much history stays on the backend.
   Future<SyncResult> compact() {
     _compactRequested = true;
     return sync();
@@ -317,12 +351,17 @@ class SyncClient {
   Future<SyncResult> _round() async {
     var received = 0;
     if (!_pulledSinceOpen) received += await _pull();
-    if (_compactRequested) {
+    final compacting = _compactRequested;
+    if (compacting) {
       _compactRequested = false;
       await _exclusive(_publishSnapshot);
     }
+    // Queued before the push so this round's pull confirms it. It may trail
+    // the pull by a round; a cursor that under-reports only keeps files.
+    _queueCursor();
     await _push();
     received += await _pull();
+    if (compacting) await _collect();
     return SyncResult(received: received, pending: pendingUploads);
   }
 
@@ -335,10 +374,10 @@ class SyncClient {
         // Failed or truncated: stays unconfirmed, re-pushed next round.
       }
     }
-    final snap = _pendingSnapshot;
-    if (snap != null) {
+    for (final MapEntry(key: name, value: file)
+        in _pendingFiles.entries.toList()) {
       try {
-        await _backend.upload(snap.name, snap.bytes);
+        await _backend.upload(name, file.bytes);
       } on Object {
         // Re-pushed next round.
       }
@@ -349,15 +388,19 @@ class SyncClient {
   /// uploads by readback; download the op files no snapshot covers; ingest.
   Future<int> _pull() async {
     final names = <String>{for (final f in await _backend.list()) f.name};
+    _lastNames = names;
+
+    for (final name in names) {
+      if (_pendingFiles.containsKey(name)) await _confirmFile(name);
+    }
 
     // Snapshots first, so the op files they cover are never downloaded.
     final unjoined = <String, List<int>>{}; // writer -> gens newer than joined
     for (final name in names) {
       final snap = SnapshotFormat.parseFileName(name);
       if (snap == null) continue;
-      if (snap.writer == deviceId && snap.gen > _gen) _gen = snap.gen;
-      if (name == _pendingSnapshot?.name) {
-        await _confirmSnapshot();
+      if (snap.writer == deviceId) {
+        if (snap.gen > _gen) _gen = snap.gen;
       } else if (snap.gen > (_joinedGen[snap.writer] ?? 0)) {
         (unjoined[snap.writer] ??= <int>[]).add(snap.gen);
       }
@@ -413,17 +456,18 @@ class SyncClient {
     _unconfirmed.remove(name);
   }
 
-  Future<void> _confirmSnapshot() async {
-    final pending = _pendingSnapshot!;
+  Future<void> _confirmFile(String name) async {
+    final pending = _pendingFiles[name]!;
     try {
-      if (!_bytesEqual(await _backend.download(pending.name), pending.bytes)) {
+      if (!_bytesEqual(await _backend.download(name), pending.bytes)) {
         return; // truncated or stale: re-pushed next round
       }
     } on Object {
       return;
     }
-    _pendingSnapshot = null;
-    if (pending.gen > _confirmedGen) _confirmedGen = pending.gen;
+    if (!identical(_pendingFiles[name]?.bytes, pending.bytes)) return;
+    _pendingFiles.remove(name);
+    pending.onConfirmed?.call();
   }
 
   /// Download and decode [name], or null if unreadable or not the op its name
@@ -507,14 +551,141 @@ class SyncClient {
 
   /// Reserve the next gen, persist the state under it, and queue the upload.
   Future<void> _publishSnapshot() async {
-    _gen++;
+    final gen = ++_gen;
     final bytes = await _saveLocal();
-    _pendingSnapshot = (
-      name: SnapshotFormat.fileName(deviceId, _gen),
+    final cut = _savedCut;
+    _pendingFiles[SnapshotFormat.fileName(deviceId, gen)] = (
       bytes: bytes,
-      gen: _gen,
+      onConfirmed: () {
+        if (gen <= _confirmedGen) return;
+        _confirmedGen = gen;
+        _confirmedCut = cut;
+      },
     );
-    _joinedGen[deviceId] = _gen;
+    _joinedGen[deviceId] = gen;
+  }
+
+  /// Announce the durable frontier, if it moved since the last cursor or
+  /// that one is getting old. Uploaded by the push, confirmed by readback.
+  void _queueCursor() {
+    final f = _frontierOver(_savedCut);
+    final now = _physicalMillis();
+    final last = _cursorFrontier;
+    if (last != null &&
+        _mapEquals(last, f) &&
+        now - _cursorTime < _retentionMs ~/ 4) {
+      return;
+    }
+    _cursorFrontier = f;
+    _cursorTime = now;
+    _pendingFiles[CursorFormat.fileName(deviceId)] = (
+      bytes: Cursor(writer: deviceId, timeMillis: now, frontier: f).encode(),
+      onConfirmed: null,
+    );
+  }
+
+  /// Step 2 of [compact]: delete own op files and superseded own snapshots
+  /// that nothing needs any more. See [compact] for the rules.
+  Future<void> _collect() async {
+    final confirmed = _confirmedCut;
+    if (confirmed == null) return; // no snapshot of ours is confirmed yet
+    final now = _physicalMillis();
+    var limit = min(confirmed[deviceId] ?? 0, _ageLimit(now - _retentionMs));
+
+    // Every other device that has left a trace on the backend holds us back
+    // until its cursor covers our ops — unless it has been silent too long.
+    final others = <String>{};
+    for (final name in _lastNames) {
+      final writer = OpFileFormat.parseFileName(name)?.deviceId ??
+          SnapshotFormat.parseFileName(name)?.writer ??
+          CursorFormat.parseFileName(name);
+      if (writer != null && writer != deviceId) others.add(writer);
+    }
+    for (final d in others) {
+      if (limit == 0) break;
+      final c = await _fetchCursor(d);
+      if (c != null && c.timeMillis < now - _retentionMs) continue; // gone
+      limit = min(limit, c?.frontier[deviceId] ?? 0);
+    }
+
+    if (limit > 0) {
+      for (final name in _lastNames) {
+        final id = OpFileFormat.parseFileName(name);
+        if (id == null || id.deviceId != deviceId || id.seq >= limit) continue;
+        try {
+          await _backend.delete(name);
+        } on Object {
+          // Still covered; the next compaction retries.
+        }
+      }
+      // The local snapshot covers them too: drop the local copies as well.
+      await _exclusive(() async {
+        final gone = <Op>[
+          for (final op in _log)
+            if (op.deviceId == deviceId && op.seq < limit) op,
+        ];
+        if (gone.isEmpty) return;
+        await _store.removeOps(gone);
+        for (final op in gone) {
+          _keys.remove(op.key);
+          _unconfirmed.remove(OpFileFormat.fileName(deviceId, op.seq));
+        }
+        _log.removeWhere((op) => op.deviceId == deviceId && op.seq < limit);
+      });
+    }
+
+    // Older own snapshots are dominated by the confirmed one.
+    for (final name in _lastNames) {
+      final snap = SnapshotFormat.parseFileName(name);
+      if (snap == null || snap.writer != deviceId) continue;
+      if (snap.gen >= _confirmedGen) continue;
+      try {
+        await _backend.delete(name);
+      } on Object {
+        // Retried next compaction.
+      }
+    }
+  }
+
+  /// One past the newest own op provably authored before [cutoff]: every own
+  /// op below the returned seq is at least that old. Ops that mint no stamp
+  /// (removes, list deletes) take the age of the next op that does, so they
+  /// are never judged older than they are.
+  int _ageLimit(int cutoff) {
+    final own = <Op>[
+      for (final op in _log)
+        if (op.deviceId == deviceId) op
+    ]..sort((a, b) => a.seq.compareTo(b.seq));
+    if (own.isEmpty) return _base[deviceId] ?? 0; // all folded away already
+    var limit = own.first.seq; // everything below it is already gone
+    for (final op in own) {
+      final Operation o;
+      try {
+        o = OperationCodec.decode(op.payload);
+      } on FormatException {
+        break;
+      }
+      final minted = switch (o) {
+        MapPut(:final hlc) => hlc,
+        SetAdd(:final tag) => tag,
+        ListInsert(:final id) => id,
+        _ => null,
+      };
+      if (minted == null) continue;
+      if (minted.wallMillis >= cutoff) break;
+      limit = op.seq + 1;
+    }
+    return limit;
+  }
+
+  Future<Cursor?> _fetchCursor(String writer) async {
+    try {
+      final c =
+          Cursor.decode(await _backend.download(CursorFormat.fileName(writer)));
+      return c.writer == writer ? c : null;
+    } on Object {
+      return null;
+    }
   }
 
   /// Save the whole state as the local snapshot at the current [frontier],
@@ -527,6 +698,7 @@ class SyncClient {
     final bytes =
         Snapshot(writer: deviceId, gen: _gen, cut: cut, state: _state).encode();
     await _store.saveSnapshot(bytes);
+    _savedCut = cut;
     _raiseBase(cut);
     final covered = <Op>[
       for (final op in _log)
@@ -554,6 +726,7 @@ class SyncClient {
       }
       _state.join(s.state);
       _raiseBase(s.cut);
+      _savedCut = s.cut;
       _gen = s.gen;
       _joinedGen[deviceId] = s.gen;
       _nextSeq = _base[deviceId] ?? 0;
@@ -580,6 +753,9 @@ class SyncClient {
         for (var i = 0; i < 16; i++)
           rng.nextInt(256).toRadixString(16).padLeft(2, '0'),
       ].join();
+
+  static bool _mapEquals(Map<String, int> a, Map<String, int> b) =>
+      a.length == b.length && a.entries.every((e) => b[e.key] == e.value);
 
   static bool _bytesEqual(Uint8List a, Uint8List b) {
     if (a.length != b.length) return false;

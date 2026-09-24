@@ -90,9 +90,11 @@ FaultConfig _buildFaults(String? forceFault) {
       f.droppedUpload = prob;
     case 'duplicate':
       f.duplicateDelivery = prob;
+    case 'dropped-delete':
+      f.droppedDelete = prob;
     default:
       stderr.writeln('unknown fault: $name '
-          '(truncated|stale|delayed|dropped|duplicate)');
+          '(truncated|stale|delayed|dropped|duplicate|dropped-delete)');
       exit(64);
   }
   return f;
@@ -147,7 +149,8 @@ hellsyncie convergence fuzzer
   --steps=N             chaos steps per run (default: 200)
   --force-fault=NAME[:P]  hold one fault at probability P through the drain to
                           demonstrate the failure path. NAME is one of:
-                          truncated | stale | delayed | dropped | duplicate
+                          truncated | stale | delayed | dropped | duplicate |
+                          dropped-delete
   --faults-during-drain keep the default fault mix active during the drain
   -h, --help            this message
 ''').join('\n'));

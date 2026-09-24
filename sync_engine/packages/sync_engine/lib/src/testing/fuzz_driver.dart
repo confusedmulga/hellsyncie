@@ -61,6 +61,8 @@ class FuzzResult {
     this.compactions = 0,
     this.snapshotFiles = 0,
     this.prunedDevices = 0,
+    this.deletedOps = 0,
+    this.sleeper,
   });
 
   final int seed;
@@ -78,6 +80,12 @@ class FuzzResult {
   /// Devices whose log ended smaller than their coverage — ops really folded
   /// away into snapshots, their own or joined.
   final int prunedDevices;
+
+  /// Op files authored in the run but gone from the backend at the end.
+  final int deletedOps;
+
+  /// The device that went offline for most of the run, if any.
+  final String? sleeper;
 }
 
 /// Knobs for a run. Everything else derives from the seed.
@@ -116,6 +124,7 @@ class FuzzConfig {
         delayedVisibility: 0.20,
         droppedUpload: 0.10,
         duplicateDelivery: 0.15,
+        droppedDelete: 0.20,
       );
 }
 
@@ -152,6 +161,12 @@ Future<FuzzResult> runFuzz(
   final stampOf = <String, Hlc>{};
   var compactions = 0;
 
+  // A third of runs have a sleeper: it syncs early (so it has a cursor that
+  // holds deletion back), then goes offline for the rest of the chaos phase
+  // while the others compact and delete past it, then must catch up.
+  final sleeper = rng.nextInt(3) == 0 ? devices.last : null;
+  final sleepFrom = cfg.steps ~/ 5;
+
   // Deterministic physical clock: a monotonic base tick plus each device's own
   // skew. Never wall-clock, so a seed reproduces every HLC exactly.
   var physicalTick = 0;
@@ -160,6 +175,7 @@ Future<FuzzResult> runFuzz(
         store: dev.store,
         deviceId: dev.id,
         physicalMillis: () => physicalTick + dev.clockSkewMs,
+        retention: _retention,
       );
 
   FuzzResult fail(String reason, int drainRounds) => FuzzResult(
@@ -169,6 +185,7 @@ Future<FuzzResult> runFuzz(
         drainRounds: drainRounds,
         failureReason: reason,
         compactions: compactions,
+        sleeper: sleeper?.id,
       );
 
   try {
@@ -182,6 +199,7 @@ Future<FuzzResult> runFuzz(
       final dev = devices[rng.nextInt(devices.length)];
       final client = dev.client;
       final roll = rng.nextInt(100);
+      final asleep = identical(dev, sleeper) && step >= sleepFrom;
       if (roll < 55) {
         // Local op over a small doc/field/element space, so devices contend
         // and merge order matters.
@@ -224,10 +242,12 @@ Future<FuzzResult> runFuzz(
           }
         }
       } else if (roll < 82) {
-        await client.sync(); // real merge round
+        if (!asleep) await client.sync(); // real merge round
       } else if (roll < 85) {
-        await client.compact(); // snapshot, shed covered ops, publish
-        compactions++;
+        if (!asleep) {
+          await client.compact(); // snapshot, delete what nothing needs
+          compactions++;
+        }
       } else if (roll < 95) {
         dev.client = await open(dev); // crash: reopen from the store
       } else {
@@ -297,9 +317,11 @@ Future<FuzzResult> runFuzz(
       }
     }
 
-    final snapshotFiles = (await inner.list())
-        .where((f) => SnapshotFormat.parseFileName(f.name) != null)
-        .length;
+    final finalNames = (await inner.list()).map((f) => f.name).toList();
+    final snapshotFiles =
+        finalNames.where((n) => SnapshotFormat.parseFileName(n) != null).length;
+    final opFiles =
+        finalNames.where((n) => OpFileFormat.parseFileName(n) != null).length;
     return FuzzResult(
       seed: seed,
       converged: true,
@@ -308,12 +330,18 @@ Future<FuzzResult> runFuzz(
       compactions: compactions,
       snapshotFiles: snapshotFiles,
       prunedDevices: devices.where((d) => d.logLength < d.coverageSize).length,
+      deletedOps: stampOf.length - opFiles,
+      sleeper: sleeper?.id,
     );
   } on Object catch (e) {
     // Nothing in a fuzz run may throw: the backend's lies are all allowed.
     return fail('threw: $e', 0);
   }
 }
+
+/// History kept on the backend in fuzz time (a few dozen steps), so op files
+/// really are deleted within one run.
+const Duration _retention = Duration(milliseconds: 30);
 
 /// The highest stamp among the ops [dev] holds — its coverage — looked up in
 /// the run's own record of what each authored op carried.
