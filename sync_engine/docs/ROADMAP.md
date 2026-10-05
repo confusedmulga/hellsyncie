@@ -75,9 +75,7 @@ OPEN (found in 3s, not yet fixed):
 - Restart cost. On open every own op is re-verified by download (that is what
   repairs a backend that lost files). O(own ops) per app start until
   compaction (Stage 4) bounds the log, or a persisted confirmation watermark.
-- No structured read API. `materialize()` returns canonical bytes, good for
-  convergence checks and useless to an app. A typed read model over the fold
-  is needed before Stage 5 — it touches the engine, so plan mode.
+- ~~No structured read API.~~ Resolved in 5a (2026-10-05).
 - Newer operation versions are skipped silently at materialize; DESIGN says
   refuse and surface "update the app".
 
@@ -186,6 +184,27 @@ COVERS: `sync_engine_flutter` — lifecycle-driven sync (resume / background),
 Android app.
 GATE: two devices/emulators sync end-to-end with no data loss.
 
+- 5a — read API, typed codecs, index edits, change stream.  [DONE 2026-10-05]
+- 5b — field + document deletion (new op; plan mode).       [NEXT]
+- 5c — Flutter binding (needs Flutter SDK + `path_provider` approval; the
+        gate needs real devices/emulators, not this container).
+
+DECIDED (owner, 2026-10-05): values stay opaque bytes in the core and on disk;
+typing lives in the API (`ValueCodec<T>`: string, int64, json, or the app's
+own). Deletion is its own slice.
+
+NOTE (5a): pure Dart, no merge-semantics or format change. `StateReader`
+(docIds, fieldValue, setElements, listEntries, ...) on `CrdtState` and
+`SyncClient`; `insertIntoListAt` / `appendToList` / `removeFromListAt`
+resolve the index inside the authoring mutex, so queued edits see the edits
+before them; `SyncClient.changes` streams the doc ids each edit or pull
+touched; `client.document(id)` gives typed `DocField` / `DocSet` / `DocList`
+views (README §8.4 now runs). Proof: an independent re-serializer built only
+from the read API equals `serialize()` on 10,000 random histories and on
+every fuzz device at convergence. Mutants caught: reversed list reads,
+unsorted set reads, a pull that forgets to emit, an index resolved outside
+the mutex.
+
 ## 6. STAGE 6 — HARDENING / 1.0.
 
 COVERS: format-migration code (0.x may break; 1.0+ migrates); public API freeze;
@@ -202,6 +221,5 @@ limitation, not a bug).
 
 CURRENT POSITION: Stages 1, 2 and 4 complete. Stage 3: 3a, 3s done; 3b (Drive)
 built and fuzz-green against a fake Drive, real-Drive verification deferred
-by the owner. Next: real-Drive check when credentials exist; Stage 5 (Flutter
-binding) needs the structured read API first (plan mode: touches the
-engine).
+by the owner. Stage 5: 5a (read API) done. Next: 5b deletion (plan mode),
+then 5c Flutter binding.

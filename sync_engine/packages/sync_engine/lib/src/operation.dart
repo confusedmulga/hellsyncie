@@ -8,6 +8,9 @@ import 'hlc.dart';
 /// every consumer to handle it.
 sealed class Operation {
   const Operation();
+
+  /// The document this operation changes.
+  String get docId;
 }
 
 /// Set a field in a document's LWW-register map. The register with the greatest

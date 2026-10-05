@@ -221,12 +221,12 @@ dart pub global activate melos
 
 ## 8. FLUTTER (ANDROID) INTEGRATION
 
-**NOTE** The merge engine (Stage 2), the folder backend (Stage 3a), and the
-pure-Dart `SyncClient` have shipped. The Drive backend (Stage 3b) is built
-but not yet verified against real Drive; the Flutter binding (Stage 5) has not
-started, per §4. The steps below are the TARGET integration - the intended, stable
-shape of the API - so an app team can plan against it now. Names may tighten
-before 1.0.
+**NOTE** The merge engine, compaction, the folder backend, the pure-Dart
+`SyncClient` and its typed document API have shipped. The Drive backend is
+built but not yet verified against real Drive. The Flutter binding
+(`SyncStore`: lifecycle wiring, `path_provider` storage, `ChangeNotifier`) has
+not started. Steps marked TARGET are its intended shape; everything else
+below runs today in pure Dart. Names may tighten before 1.0.
 
 8.1 Add dependencies. In the app's `pubspec.yaml`:
 
@@ -250,7 +250,7 @@ dependencies:
     permission. Sign-in is the user's own Google account via the standard
     consent screen - you do not build or host anything.
 
-8.3 Open a store on app start. Target API:
+8.3 Open a store on app start. TARGET API (the Flutter binding):
 
 ```dart
 import 'package:sync_engine/sync_engine.dart';
@@ -265,29 +265,38 @@ final backend = DriveBackend(authenticatedClient);
 final store = await SyncStore.open(backend: backend);
 ```
 
-8.4 Declare data as CRDT types. Target API:
+8.4 Declare data as CRDT types. Works today on a `SyncClient`:
 
 ```dart
 // A note: title is a last-write-wins field; tags are an add-wins set;
-// checklist items are an ordered (RGA) list.
-final note = store.document('note:42');
-note.field('title').set('Groceries');
-note.set('tags').add('home');
-final items = note.list('items');
-items.insert(0, 'Milk');
+// checklist items are an ordered (RGA) list. Values are typed by a codec;
+// on disk they stay opaque bytes (ValueCodec.string / int64 / json, or yours).
+final note = client.document('note:42');
+await note.field('title', ValueCodec.string).set('Groceries');
+await note.set('tags', ValueCodec.string).add('home');
+final items = note.list('items', ValueCodec.string);
+await items.insert(0, 'Milk');
+await items.add('Eggs');
+print(items.values); // [Milk, Eggs]
 ```
+
+    **NOTE** List indexes mean "as this device sees the list right now".
+    Concurrent inserts on other devices interleave deterministically. Use
+    `items.entries` ids, not indexes, as UI keys - they survive merges.
 
     **WARNING** Do not store the body of a document as one field if two devices
     may edit it at once - one side's edit is dropped by design at this stage.
     Rich-text merge is deferred to 1.0.
 
-8.5 Sync. Target API - call after local edits, on reconnect, and on resume:
+8.5 Sync - call after local edits, on reconnect, and on resume. Works today:
 
 ```dart
-await store.sync();        // one round: push local, pull remote, converge
+await client.sync();       // one round: push local, pull remote, converge
+await client.compact();    // occasionally: snapshot, prune old history
 
-// React to changes arriving from other devices:
-store.changes.listen((_) => setState(() {}));
+// React to changes - local edits and anything a sync brought in:
+note.changes.listen((_) => print('note:42 changed'));
+client.changes.listen((docIds) => print('changed: $docIds'));
 ```
 
 8.6 Background / lifecycle (Android). Trigger `store.sync()`:
@@ -321,8 +330,9 @@ await client.sync(); // push, pull, confirm by readback
     **WARNING** Never copy a local store directory to another device. The
     device id inside must stay unique to one install.
 
-    **NOTE** Reading state back is not yet typed: `materialize()` returns the
-    canonical merged bytes. A structured read API is an open roadmap item.
+    Reading back: `client.document(id)` (typed, as in 8.4), or the raw
+    `StateReader` methods on the client (`docIds`, `fieldValue`,
+    `setElements`, `listEntries`, ...).
 
     Writing a backend of your own? Prove it under the same fault fuzzer:
 

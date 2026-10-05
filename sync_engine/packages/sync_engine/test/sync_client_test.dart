@@ -54,6 +54,15 @@ class _CountingBackend extends MemoryBackend {
   }
 }
 
+/// A store whose appends take real time, so queued edits interleave.
+class _SlowStore extends MemoryStore {
+  @override
+  Future<void> appendOps(List<Op> ops) async {
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+    await super.appendOps(ops);
+  }
+}
+
 /// Reports success for one named upload while persisting nothing.
 class _DroppingBackend implements Backend {
   _DroppingBackend(this.inner, this.drop);
@@ -304,6 +313,153 @@ void main() {
     expect(backend.lists, 3);
     expect(results.every((r) => r.pending == 0), isTrue);
     expect(c.ops, hasLength(1));
+  });
+
+  group('reads and index edits', () {
+    List<String> texts(List<Uint8List> b) =>
+        b.map((x) => String.fromCharCodes(x)).toList();
+    List<String> listTexts(SyncClient c, String doc, String list) => c
+        .listEntries(doc, list)
+        .map((e) => String.fromCharCodes(e.value))
+        .toList();
+
+    test('every type reads back', () async {
+      final c = await _open(MemoryBackend(), id: 'a');
+      await c.put('n1', 'title', _b('Groceries'));
+      await c.put('n1', 'title', _b('Shopping'));
+      await c.addToSet('n1', 'tags', _b('work'));
+      await c.addToSet('n1', 'tags', _b('home'));
+      await c.removeFromSet('n1', 'tags', _b('work'));
+      await c.appendToList('n2', 'items', _b('Milk'));
+      expect(c.docIds, <String>['n1', 'n2']);
+      expect(c.fieldNames('n1'), <String>['title']);
+      expect(String.fromCharCodes(c.fieldValue('n1', 'title')!), 'Shopping');
+      expect(c.fieldValue('n1', 'missing'), isNull);
+      expect(c.setNames('n1'), <String>['tags']);
+      expect(texts(c.setElements('n1', 'tags')), <String>['home']);
+      expect(c.setContains('n1', 'tags', _b('home')), isTrue);
+      expect(c.setContains('n1', 'tags', _b('work')), isFalse);
+      expect(c.listNames('n2'), <String>['items']);
+      expect(listTexts(c, 'n2', 'items'), <String>['Milk']);
+      expect(c.listEntries('n9', 'none'), isEmpty);
+    });
+
+    test('index inserts and removes land where asked', () async {
+      final c = await _open(MemoryBackend(), id: 'a');
+      await c.insertIntoListAt('d', 'l', 0, _b('B'));
+      await c.insertIntoListAt('d', 'l', 0, _b('A')); // head
+      await c.insertIntoListAt('d', 'l', 2, _b('D')); // end
+      await c.insertIntoListAt('d', 'l', 2, _b('C')); // middle
+      await c.appendToList('d', 'l', _b('E'));
+      expect(listTexts(c, 'd', 'l'), <String>['A', 'B', 'C', 'D', 'E']);
+      await c.removeFromListAt('d', 'l', 1);
+      await c.removeFromListAt('d', 'l', 3);
+      expect(listTexts(c, 'd', 'l'), <String>['A', 'C', 'D']);
+
+      final before = c.ops.length;
+      await expectLater(
+          c.insertIntoListAt('d', 'l', 4, _b('X')), throwsRangeError);
+      await expectLater(
+          c.insertIntoListAt('d', 'l', -1, _b('X')), throwsRangeError);
+      await expectLater(c.removeFromListAt('d', 'l', 3), throwsRangeError);
+      expect(c.ops.length, before, reason: 'a rejected edit authors nothing');
+    });
+
+    test('queued edits resolve their index after the edits before them',
+        () async {
+      final store = _SlowStore();
+      final c = await _open(MemoryBackend(), id: 'a', store: store);
+      // Not awaited one by one: the second and third are queued behind slow
+      // store writes, and must see the inserts before them.
+      await Future.wait(<Future<Object?>>[
+        c.insertIntoListAt('d', 'l', 0, _b('A')),
+        c.insertIntoListAt('d', 'l', 1, _b('B')),
+        c.appendToList('d', 'l', _b('C')),
+      ]);
+      expect(listTexts(c, 'd', 'l'), <String>['A', 'B', 'C']);
+    });
+
+    test('concurrent index inserts converge; each device saw its own in place',
+        () async {
+      final backend = MemoryBackend();
+      final a = await _open(backend, id: 'a');
+      final b = await _open(backend, id: 'b');
+      await a.appendToList('d', 'l', _b('X'));
+      await a.appendToList('d', 'l', _b('Z'));
+      await a.sync();
+      await b.sync();
+
+      await a.insertIntoListAt('d', 'l', 1, _b('A'));
+      await b.insertIntoListAt('d', 'l', 1, _b('B'));
+      expect(listTexts(a, 'd', 'l'), <String>['X', 'A', 'Z']);
+      expect(listTexts(b, 'd', 'l'), <String>['X', 'B', 'Z']);
+
+      await a.sync();
+      await b.sync();
+      await a.sync();
+      expect(a.materialize(), b.materialize());
+      final merged = listTexts(a, 'd', 'l');
+      expect(merged.first, 'X');
+      expect(merged.last, 'Z');
+      expect(merged.sublist(1, 3).toSet(), <String>{'A', 'B'});
+    });
+  });
+
+  group('change stream', () {
+    Future<List<Set<String>>> collect(
+        SyncClient c, Future<void> Function() action) async {
+      final events = <Set<String>>[];
+      final sub = c.changes.listen(events.add);
+      await action();
+      await Future<void>.delayed(Duration.zero); // delivery is asynchronous
+      await sub.cancel();
+      return events;
+    }
+
+    test('a local edit reports its document', () async {
+      final c = await _open(MemoryBackend(), id: 'a');
+      expect(await collect(c, () => c.put('d1', 'f', _b('v'))), <Set<String>>[
+        <String>{'d1'}
+      ]);
+      expect(await collect(c, () => c.removeFromSet('d1', 's', _b('none'))),
+          isEmpty,
+          reason: 'nothing authored, nothing changed');
+    });
+
+    test('a pull reports the documents it changed, and an idle one nothing',
+        () async {
+      final backend = MemoryBackend();
+      final a = await _open(backend, id: 'a');
+      final b = await _open(backend, id: 'b');
+      await a.put('d1', 'f', _b('1'));
+      await a.addToSet('d2', 's', _b('x'));
+      await a.sync();
+      final events = await collect(b, b.sync);
+      expect(events.expand((e) => e).toSet(), <String>{'d1', 'd2'});
+      expect(await collect(b, b.sync), isEmpty);
+    });
+
+    test('a joined snapshot reports its documents', () async {
+      final backend = MemoryBackend();
+      final a = await _open(backend, id: 'a');
+      await a.put('snapdoc', 'f', _b('v'));
+      await a.compact();
+      final c = await _open(backend, id: 'c');
+      final events = await collect(c, c.sync);
+      expect(events.expand((e) => e), contains('snapdoc'));
+    });
+
+    test('close ends the stream; the client keeps working', () async {
+      final c = await _open(MemoryBackend(), id: 'a');
+      final done = c.changes.toList();
+      await c.put('d', 'f', _b('1'));
+      await c.close();
+      expect(await done, <Set<String>>[
+        <String>{'d'}
+      ]);
+      await c.put('d', 'f', _b('2')); // no throw after close
+      expect(String.fromCharCodes(c.fieldValue('d', 'f')!), '2');
+    });
   });
 
   group('compaction', () {

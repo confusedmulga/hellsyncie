@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
 
 import 'backend.dart';
 import 'crdt_state.dart';
+import 'crdt/rga.dart';
 import 'cursor.dart';
+import 'document.dart';
 import 'format.dart';
 import 'hlc.dart';
 import 'local_store.dart';
@@ -12,6 +15,7 @@ import 'op_codec.dart';
 import 'operation.dart';
 import 'operation_codec.dart';
 import 'snapshot.dart';
+import 'state_reader.dart';
 
 /// Thrown by [SyncClient] when the backend holds a DIFFERENT op under an
 /// identity this device also authored: two stores are writing under one
@@ -62,7 +66,7 @@ class SyncResult {
 /// skewed the wall clocks. Without that, a slow-clocked device's later field
 /// write loses to the write it was replacing, and its list insert lands after
 /// siblings it was meant to precede.
-class SyncClient {
+class SyncClient implements StateReader {
   SyncClient._(
     this.deviceId,
     this._backend,
@@ -224,6 +228,55 @@ class SyncClient {
   List<Hlc> listElementIds(String docId, String listField) =>
       _state.elementIds(docId, listField);
 
+  // --- reads (see StateReader) ---
+
+  @override
+  List<String> get docIds => _state.docIds;
+
+  @override
+  List<String> fieldNames(String docId) => _state.fieldNames(docId);
+
+  @override
+  Uint8List? fieldValue(String docId, String field) =>
+      _state.fieldValue(docId, field);
+
+  @override
+  List<String> setNames(String docId) => _state.setNames(docId);
+
+  @override
+  List<Uint8List> setElements(String docId, String setField) =>
+      _state.setElements(docId, setField);
+
+  @override
+  bool setContains(String docId, String setField, Uint8List element) =>
+      _state.setContains(docId, setField, element);
+
+  @override
+  List<String> listNames(String docId) => _state.listNames(docId);
+
+  @override
+  List<ListEntry> listEntries(String docId, String listField) =>
+      _state.listEntries(docId, listField);
+
+  /// A typed view of one document. See [Document].
+  Document document(String docId) => Document(this, docId);
+
+  /// The ids of the documents each local edit or pull changed. Broadcast,
+  /// delivered asynchronously; a pull that brings nothing new emits nothing.
+  /// A joined snapshot reports every document it holds.
+  Stream<Set<String>> get changes => _changes.stream;
+
+  final StreamController<Set<String>> _changes =
+      StreamController<Set<String>>.broadcast();
+
+  void _emit(Set<String> docs) {
+    if (docs.isNotEmpty && !_changes.isClosed) _changes.add(docs);
+  }
+
+  /// Close [changes]. The client itself stays usable; call this when the
+  /// last listener goes away (a Flutter `dispose`).
+  Future<void> close() => _changes.close();
+
   // --- authoring ---
 
   /// Set [field] of [docId] (LWW register).
@@ -285,6 +338,61 @@ class SyncClient {
             elementId: elementId,
           ));
 
+  /// Insert [value] so it sits at [index] of the list as this device sees it
+  /// (0 = first, the list's length = last). The index is resolved against
+  /// the list at the moment the op is authored, after any edit queued before
+  /// it. Throws [RangeError] if [index] is out of range. Returns the id.
+  Future<Hlc> insertIntoListAt(
+    String docId,
+    String listField,
+    int index,
+    Uint8List value,
+  ) =>
+      _insertResolved(docId, listField, value, (entries) {
+        RangeError.checkValueInInterval(index, 0, entries.length, 'index');
+        return index;
+      });
+
+  /// Insert [value] at the end of the list as this device sees it.
+  Future<Hlc> appendToList(String docId, String listField, Uint8List value) =>
+      _insertResolved(docId, listField, value, (entries) => entries.length);
+
+  /// Delete the element at [index] of the list as this device sees it,
+  /// resolved when the op is authored. Throws [RangeError] if out of range.
+  Future<void> removeFromListAt(String docId, String listField, int index) =>
+      _author(() {
+        final entries = _state.listEntries(docId, listField);
+        RangeError.checkValidIndex(index, entries, 'index');
+        return ListDelete(
+          docId: docId,
+          listField: listField,
+          elementId: entries[index].id,
+        );
+      });
+
+  Future<Hlc> _insertResolved(
+    String docId,
+    String listField,
+    Uint8List value,
+    int Function(List<ListEntry>) indexIn,
+  ) async {
+    late Hlc id;
+    await _author(() {
+      final entries = _state.listEntries(docId, listField);
+      final index = indexIn(entries);
+      // The new id orders after every id held (causality), so among the
+      // anchor's children it sorts first: it lands exactly at [index].
+      return ListInsert(
+        docId: docId,
+        listField: listField,
+        id: id = _tick(),
+        after: index == 0 ? null : entries[index - 1].id,
+        value: value,
+      );
+    });
+    return id;
+  }
+
   Hlc _tick() => _clock = _clock.send(_physicalMillis());
 
   Future<void> _author(Operation? Function() build) => _exclusive(() async {
@@ -297,6 +405,7 @@ class SyncClient {
         _log.add(op);
         _state.apply(operation);
         _unconfirmed[OpFileFormat.fileName(deviceId, op.seq)] = op;
+        _emit(<String>{operation.docId});
       });
 
   Future<T> _exclusive<T>(Future<T> Function() body) {
@@ -494,10 +603,12 @@ class SyncClient {
   Future<int> _ingest(List<Op> fetched, List<Snapshot> snapshots) =>
       _exclusive(() async {
         final before = _state.maxStamp;
+        final touched = <String>{};
         var joined = 0;
         for (final s in snapshots) {
           if (s.gen <= (_joinedGen[s.writer] ?? 0)) continue;
           _state.join(s.state);
+          touched.addAll(s.state.docIds);
           _raiseBase(s.cut);
           _joinedGen[s.writer] = s.gen;
           joined++;
@@ -525,10 +636,12 @@ class SyncClient {
           for (final op in fresh) {
             _keys.add(op.key);
             _log.add(op);
-            _state.applyOp(op);
+            final decoded = _state.applyOp(op);
+            if (decoded != null) touched.add(decoded.docId);
             if (op.deviceId == deviceId) _nextSeq = max(_nextSeq, op.seq + 1);
           }
         }
+        _emit(touched);
         final high = _state.maxStamp;
         if (high != null && high != before) {
           _clock = _clock.receive(high, _physicalMillis());

@@ -11,6 +11,7 @@ import '../operation_codec.dart';
 import '../sync_client.dart';
 import 'faulty_backend.dart';
 import 'memory_backend.dart';
+import 'read_view.dart';
 
 /// One simulated device: a durable [store] and the [client] currently open on
 /// it. A crash discards the client and reopens a new one from the store, so
@@ -291,6 +292,14 @@ Future<FuzzResult> runFuzz(
             'device ${d.id} merged state diverged from ${devices.first.id}: '
             '${state.length} bytes vs ${reference.length}',
             rounds);
+      }
+    }
+
+    // The read API must expose exactly the merged state, on every device.
+    for (final d in devices) {
+      if (!_bytesEqual(serializeFromReads(d.client), d.client.materialize())) {
+        return fail(
+            'device ${d.id}: read API disagrees with the merged state', rounds);
       }
     }
 

@@ -8,6 +8,7 @@ import 'hlc.dart';
 import 'op.dart';
 import 'operation.dart';
 import 'operation_codec.dart';
+import 'state_reader.dart';
 import 'wire.dart';
 
 /// The merged CRDT state of every document: LWW-register maps, OR-sets, and
@@ -21,7 +22,7 @@ import 'wire.dart';
 ///
 /// [serialize] is the canonical rendered form: byte-identical on every device
 /// that folded the same op set, however it got them.
-class CrdtState {
+class CrdtState implements StateReader {
   final Map<String, Map<String, LwwRegister>> _lww =
       <String, Map<String, LwwRegister>>{}; // doc -> field -> register
   final Map<String, Map<String, OrSet>> _sets =
@@ -35,15 +36,17 @@ class CrdtState {
   /// A clock set at or above it orders after every op folded in.
   Hlc? get maxStamp => _maxStamp;
 
-  /// Fold one op in. An undecodable payload is skipped, like a corrupt file.
-  void applyOp(Op op) {
+  /// Fold one op in and return what it decoded to. An undecodable payload is
+  /// skipped, like a corrupt file, and yields null.
+  Operation? applyOp(Op op) {
     final Operation decoded;
     try {
       decoded = OperationCodec.decode(op.payload);
     } on FormatException {
-      return;
+      return null;
     }
     apply(decoded);
+    return decoded;
   }
 
   /// Fold one operation in. Idempotent and order-independent.
@@ -112,6 +115,48 @@ class CrdtState {
   /// ascending.
   List<Hlc> elementIds(String docId, String listField) =>
       _lists[docId]?[listField]?.ids() ?? <Hlc>[];
+
+  // --- reads ---
+
+  /// Every document with any field, set, or list, sorted.
+  @override
+  List<String> get docIds =>
+      <String>{..._lww.keys, ..._sets.keys, ..._lists.keys}.toList()..sort();
+
+  /// Names of the fields of [docId] that were ever set, sorted.
+  @override
+  List<String> fieldNames(String docId) =>
+      (_lww[docId]?.keys.toList() ?? <String>[])..sort();
+
+  /// The winning value of [field] in [docId], or null if it was never set.
+  @override
+  Uint8List? fieldValue(String docId, String field) =>
+      _lww[docId]?[field]?.value;
+
+  /// Names of the OR-sets of [docId], sorted (including ones now empty).
+  @override
+  List<String> setNames(String docId) =>
+      (_sets[docId]?.keys.toList() ?? <String>[])..sort();
+
+  /// The elements present in the OR-set, sorted by bytes.
+  @override
+  List<Uint8List> setElements(String docId, String setField) =>
+      (_sets[docId]?[setField]?.present().toList() ?? <Uint8List>[])
+        ..sort(_cmpBytes);
+
+  @override
+  bool setContains(String docId, String setField, Uint8List element) =>
+      _sets[docId]?[setField]?.contains(element) ?? false;
+
+  /// Names of the lists of [docId], sorted (including ones now empty).
+  @override
+  List<String> listNames(String docId) =>
+      (_lists[docId]?.keys.toList() ?? <String>[])..sort();
+
+  /// The visible elements of the list, in order, each with its id.
+  @override
+  List<ListEntry> listEntries(String docId, String listField) =>
+      _lists[docId]?[listField]?.entries() ?? <ListEntry>[];
 
   // --- canonical rendered form ---
 

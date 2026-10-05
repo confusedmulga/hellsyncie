@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Read API: `StateReader` (`docIds`, `fieldNames`, `fieldValue`, `setNames`,
+  `setElements`, `setContains`, `listNames`, `listEntries`) on `CrdtState`
+  and `SyncClient`; `ListEntry` (id + value); `Rga.entries()`.
+- `SyncClient.insertIntoListAt` / `appendToList` / `removeFromListAt`;
+  `changes` stream of touched doc ids; `close()`; `document(id)`.
+- Typed facade: `ValueCodec` (`string`, `int64`, `json`), `Document`,
+  `DocField`, `DocSet`, `DocList`.
+- `Operation.docId`; `CrdtState.applyOp` returns the decoded operation.
+- testing: `serializeFromReads` oracle; fuzz asserts it at convergence.
 - Remote deletion: `Cursor` / `CursorFormat` (`cursor_<id>.bin`), written
   each round the durable frontier moves; `compact()` deletes own op files
   (covered by the confirmed own snapshot, held by every live device, older

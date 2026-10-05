@@ -15,3 +15,4 @@ import 'sync_engine.dart';
 export 'src/testing/faulty_backend.dart';
 export 'src/testing/fuzz_driver.dart';
 export 'src/testing/memory_backend.dart';
+export 'src/testing/read_view.dart';

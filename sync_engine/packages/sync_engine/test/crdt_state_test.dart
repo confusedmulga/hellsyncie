@@ -2,6 +2,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:sync_engine/sync_engine.dart';
+import 'package:sync_engine/testing.dart';
 import 'package:test/test.dart';
 
 import 'support/reference_fold.dart';
@@ -128,6 +129,26 @@ void main() {
       final expected = reference.materialize(ops);
       expect(engine.materialize(deliver(ops, rng)), expected,
           reason: 'history $i');
+    }
+  });
+
+  test('the read API exposes exactly the merged state (10k histories)', () {
+    final rng = Random(4010);
+    for (var i = 0; i < 10000; i++) {
+      final ops = randomHistory(rng);
+      final s = CrdtEngine.fold(deliver(ops, rng));
+      if (rng.nextBool()) s.prune();
+      expect(serializeFromReads(s), s.serialize(), reason: 'history $i');
+      for (final doc in s.docIds) {
+        for (final list in s.listNames(doc)) {
+          // Visible entries are a subset of every inserted id, in list order
+          // (which matches the rendering, checked above).
+          final all = s.elementIds(doc, list).toSet();
+          expect(
+              s.listEntries(doc, list).every((e) => all.contains(e.id)), isTrue,
+              reason: 'history $i');
+        }
+      }
     }
   });
 

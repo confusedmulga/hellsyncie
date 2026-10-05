@@ -3,6 +3,18 @@ import 'dart:typed_data';
 import '../hlc.dart';
 import '../wire.dart';
 
+/// One visible element of an RGA list: its stable id (an anchor for inserts,
+/// and a key that survives concurrent edits) and its value.
+class ListEntry {
+  const ListEntry(this.id, this.value);
+
+  final Hlc id;
+  final Uint8List value;
+
+  @override
+  String toString() => 'ListEntry($id, ${value.length} B)';
+}
+
 /// Replicated Growable Array — an ordered-list CRDT.
 ///
 /// Each element has a unique HLC id and is anchored immediately after another
@@ -48,8 +60,12 @@ class Rga {
   }
 
   /// Visible element values, in list order.
-  List<Uint8List> toList() {
-    final out = <Uint8List>[];
+  List<Uint8List> toList() => <Uint8List>[for (final e in entries()) e.value];
+
+  /// Visible elements with their ids, in list order. The one traversal both
+  /// rendering and reads use, so they can never disagree.
+  List<ListEntry> entries() {
+    final out = <ListEntry>[];
     void visit(String anchor) {
       final kids = _children[anchor];
       if (kids == null) return;
@@ -57,7 +73,7 @@ class Rga {
         ..sort((a, b) => _nodes[b]!.id.compareTo(_nodes[a]!.id)); // id desc
       for (final k in ordered) {
         final node = _nodes[k]!;
-        if (!node.deleted) out.add(node.value);
+        if (!node.deleted) out.add(ListEntry(node.id, node.value));
         visit(k); // recurse regardless: a tombstone still anchors its children
       }
     }
